@@ -39,6 +39,7 @@ use cosmic_text::LayoutGlyph;
 use indexmap::IndexSet;
 use std::{
     array,
+    borrow::Cow,
     cell::Cell,
     cmp,
     collections::HashMap,
@@ -46,7 +47,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Action, Terminal, TerminalScroll, menu::MenuState, terminal::Metadata};
+use crate::{
+    Action, Terminal, TerminalScroll,
+    menu::MenuState,
+    terminal::{
+        Metadata, block_element_alpha, block_element_rects, box_drawing_rects, is_block_element,
+    },
+};
 
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -729,6 +736,49 @@ where
             color: Color::from_rgba(1.0, 1.0, 1.0, 1.0), // TODO
             clip_bounds: Rectangle::new(view_position, Size::new(view_w as f32, view_h as f32)),
         });
+
+        // Render custom glyph quads above the text buffer.
+        {
+            let cell_width = terminal.size().cell_width;
+            let cell_height = terminal.size().cell_height;
+            for glyph in &terminal.builtin_glyphs {
+                let x = view_position.x + glyph.column as f32 * cell_width;
+                let y = view_position.y + glyph.line as f32 * cell_height;
+                let alpha = if is_block_element(glyph.c) {
+                    block_element_alpha(glyph.c)
+                } else {
+                    1.0
+                };
+                let color = Color::from_rgba(
+                    f32::from(glyph.color.r()) / 255.0,
+                    f32::from(glyph.color.g()) / 255.0,
+                    f32::from(glyph.color.b()) / 255.0,
+                    f32::from(glyph.color.a()) / 255.0 * alpha,
+                );
+                let rects = if is_block_element(glyph.c) {
+                    Cow::Borrowed(block_element_rects(glyph.c))
+                } else {
+                    Cow::Owned(box_drawing_rects(glyph.c, cell_width, cell_height))
+                };
+                for &(pos, size) in rects.iter() {
+                    // Round shared edges identically so adjacent cells tile without seams
+                    let left = (x + pos[0] * cell_width).round();
+                    let top = (y + pos[1] * cell_height).round();
+                    let right = (x + (pos[0] + size[0]) * cell_width).round();
+                    let bottom = (y + (pos[1] + size[1]) * cell_height).round();
+                    renderer.fill_quad(
+                        Quad {
+                            bounds: Rectangle::new(
+                                Point::new(left, top),
+                                Size::new(right - left, bottom - top),
+                            ),
+                            ..Default::default()
+                        },
+                        color,
+                    );
+                }
+            }
+        }
 
         // Draw scrollbar
         if let Some((start, end)) = terminal.scrollbar() {

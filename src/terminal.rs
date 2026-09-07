@@ -214,6 +214,475 @@ pub struct Metadata {
     pub flags: Flags,
 }
 
+/// A block element or box-drawing cell rendered as quads at exact cell geometry.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinGlyph {
+    /// Buffer line, i.e. viewport row counted from the top.
+    pub line: usize,
+    /// Cell column.
+    pub column: usize,
+    /// The block element or box drawing character.
+    pub c: char,
+    /// Foreground color of the cell, after all color swaps.
+    pub color: cosmic_text::Color,
+}
+
+/// Whether the character is drawn by the terminal itself, as rectangles at
+/// exact cell geometry, instead of a font glyph.
+///
+/// Covers block elements and box drawing characters. The diagonal box drawing
+/// characters (U+2571..=U+2573) cannot be composed from axis-aligned
+/// rectangles and are left to the font.
+pub fn is_builtin_glyph(c: char) -> bool {
+    is_block_element(c) || is_box_drawing(c)
+}
+
+pub fn is_block_element(c: char) -> bool {
+    matches!(c, '\u{2580}'..='\u{259F}')
+}
+
+pub fn is_box_drawing(c: char) -> bool {
+    matches!(c, '\u{2500}'..='\u{2570}' | '\u{2574}'..='\u{257F}')
+}
+
+/// Rectangles covering the filled fraction of a block element cell, as
+/// (x, y), (width, height) fractions of the cell with y measured from the top.
+///
+/// Must only be called for characters where [`is_block_element`] is true.
+pub fn block_element_rects(c: char) -> &'static [([f32; 2], [f32; 2])] {
+    match c {
+        '\u{2580}' => &[([0.0, 0.0], [1.0, 0.5])], // ▀ upper half
+        '\u{2581}' => &[([0.0, 7.0 / 8.0], [1.0, 1.0 / 8.0])], // ▁ lower one eighth
+        '\u{2582}' => &[([0.0, 3.0 / 4.0], [1.0, 1.0 / 4.0])], // ▂ lower one quarter
+        '\u{2583}' => &[([0.0, 5.0 / 8.0], [1.0, 3.0 / 8.0])], // ▃ lower three eighths
+        '\u{2584}' => &[([0.0, 0.5], [1.0, 0.5])], // ▄ lower half
+        '\u{2585}' => &[([0.0, 3.0 / 8.0], [1.0, 5.0 / 8.0])], // ▅ lower five eighths
+        '\u{2586}' => &[([0.0, 1.0 / 4.0], [1.0, 3.0 / 4.0])], // ▆ lower three quarters
+        '\u{2587}' => &[([0.0, 1.0 / 8.0], [1.0, 7.0 / 8.0])], // ▇ lower seven eighths
+        '\u{2588}' => &[([0.0, 0.0], [1.0, 1.0])], // █ full block
+        '\u{2589}' => &[([0.0, 0.0], [7.0 / 8.0, 1.0])], // ▉ left seven eighths
+        '\u{258A}' => &[([0.0, 0.0], [3.0 / 4.0, 1.0])], // ▊ left three quarters
+        '\u{258B}' => &[([0.0, 0.0], [5.0 / 8.0, 1.0])], // ▋ left five eighths
+        '\u{258C}' => &[([0.0, 0.0], [0.5, 1.0])], // ▌ left half
+        '\u{258D}' => &[([0.0, 0.0], [3.0 / 8.0, 1.0])], // ▍ left three eighths
+        '\u{258E}' => &[([0.0, 0.0], [1.0 / 4.0, 1.0])], // ▎ left one quarter
+        '\u{258F}' => &[([0.0, 0.0], [1.0 / 8.0, 1.0])], // ▏ left one eighth
+        '\u{2590}' => &[([0.5, 0.0], [0.5, 1.0])], // ▐ right half
+        '\u{2591}' | '\u{2592}' | '\u{2593}' => &[([0.0, 0.0], [1.0, 1.0])], // ░▒▓ shades
+        '\u{2594}' => &[([0.0, 0.0], [1.0, 1.0 / 8.0])], // ▴ upper one eighth
+        '\u{2595}' => &[([7.0 / 8.0, 0.0], [1.0 / 8.0, 1.0])], // ▵ right one eighth
+        '\u{2596}' => &[([0.0, 0.5], [0.5, 0.5])], // ▖ quadrant lower left
+        '\u{2597}' => &[([0.5, 0.5], [0.5, 0.5])], // ▗ quadrant lower right
+        '\u{2598}' => &[([0.0, 0.0], [0.5, 0.5])], // ▘ quadrant upper left
+        '\u{2599}' => &[
+            // ▙ quadrant upper left, lower left and lower right
+            ([0.0, 0.0], [0.5, 1.0]),
+            ([0.5, 0.5], [0.5, 0.5]),
+        ],
+        '\u{259A}' => &[
+            // ▚ quadrant upper left and lower right
+            ([0.0, 0.0], [0.5, 0.5]),
+            ([0.5, 0.5], [0.5, 0.5]),
+        ],
+        '\u{259B}' => &[
+            // ▛ quadrant upper left, upper right and lower left
+            ([0.0, 0.0], [1.0, 0.5]),
+            ([0.0, 0.5], [0.5, 0.5]),
+        ],
+        '\u{259C}' => &[
+            // ▜ quadrant upper left, upper right and lower right
+            ([0.0, 0.0], [1.0, 0.5]),
+            ([0.5, 0.5], [0.5, 0.5]),
+        ],
+        '\u{259D}' => &[([0.5, 0.0], [0.5, 0.5])], // ▝ quadrant upper right
+        '\u{259E}' => &[
+            // ▞ quadrant upper right and lower left
+            ([0.5, 0.0], [0.5, 0.5]),
+            ([0.0, 0.5], [0.5, 0.5]),
+        ],
+        '\u{259F}' => &[
+            // ▟ quadrant upper right, lower left and lower right
+            ([0.5, 0.0], [0.5, 1.0]),
+            ([0.0, 0.5], [0.5, 0.5]),
+        ],
+        _ => &[],
+    }
+}
+
+/// Alpha used to approximate the fill density of shade block elements.
+///
+/// Must only be called for characters where [`is_block_element`] is true.
+pub fn block_element_alpha(c: char) -> f32 {
+    match c {
+        '\u{2591}' => 0.25, // ░ light shade
+        '\u{2592}' => 0.5,  // ▒ medium shade
+        '\u{2593}' => 0.75, // ▓ dark shade
+        _ => 1.0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stroke {
+    None,
+    Light,
+    Heavy,
+    Double,
+}
+
+/// Arms of a box drawing line character, as (up, down, left, right) strokes
+/// running from the cell center towards the named edge.
+///
+/// Returns `None` for dashed and rounded characters, which are handled
+/// separately by [`box_drawing_rects`].
+fn box_drawing_arms(c: char) -> Option<(Stroke, Stroke, Stroke, Stroke)> {
+    use Stroke::{Double as D, Heavy as H, Light as L, None as N};
+    Some(match c {
+        '\u{2500}' => (N, N, L, L), // ─
+        '\u{2501}' => (N, N, H, H), // ━
+        '\u{2502}' => (L, L, N, N), // │
+        '\u{2503}' => (H, H, N, N), // ┃
+        '\u{250C}' => (N, L, N, L), // ┌
+        '\u{250D}' => (N, L, N, H), // ┍
+        '\u{250E}' => (N, H, N, L), // ┎
+        '\u{250F}' => (N, H, N, H), // ┏
+        '\u{2510}' => (N, L, L, N), // ┐
+        '\u{2511}' => (N, L, H, N), // ┑
+        '\u{2512}' => (N, H, L, N), // ┒
+        '\u{2513}' => (N, H, H, N), // ┓
+        '\u{2514}' => (L, N, N, L), // └
+        '\u{2515}' => (L, N, N, H), // ┕
+        '\u{2516}' => (H, N, N, L), // ┖
+        '\u{2517}' => (H, N, N, H), // ┗
+        '\u{2518}' => (L, N, L, N), // ┘
+        '\u{2519}' => (L, N, H, N), // ┙
+        '\u{251A}' => (H, N, L, N), // ┚
+        '\u{251B}' => (H, N, H, N), // ┛
+        '\u{251C}' => (L, L, N, L), // ├
+        '\u{251D}' => (L, L, N, H), // ┝
+        '\u{251E}' => (H, L, N, L), // ┞
+        '\u{251F}' => (L, H, N, L), // ┟
+        '\u{2520}' => (H, H, N, L), // ┠
+        '\u{2521}' => (H, L, N, H), // ┡
+        '\u{2522}' => (L, H, N, H), // ┢
+        '\u{2523}' => (H, H, N, H), // ┣
+        '\u{2524}' => (L, L, L, N), // ┤
+        '\u{2525}' => (L, L, H, N), // ┥
+        '\u{2526}' => (H, L, L, N), // ┦
+        '\u{2527}' => (L, H, L, N), // ┧
+        '\u{2528}' => (H, H, L, N), // ┨
+        '\u{2529}' => (H, L, H, N), // ┩
+        '\u{252A}' => (L, H, H, N), // ┪
+        '\u{252B}' => (H, H, H, N), // ┫
+        '\u{252C}' => (N, L, L, L), // ┬
+        '\u{252D}' => (N, L, H, L), // ┭
+        '\u{252E}' => (N, L, L, H), // ┮
+        '\u{252F}' => (N, L, H, H), // ┯
+        '\u{2530}' => (N, H, L, L), // ┰
+        '\u{2531}' => (N, H, H, L), // ┱
+        '\u{2532}' => (N, H, L, H), // ┲
+        '\u{2533}' => (N, H, H, H), // ┳
+        '\u{2534}' => (L, N, L, L), // ┴
+        '\u{2535}' => (L, N, H, L), // ┵
+        '\u{2536}' => (L, N, L, H), // ┶
+        '\u{2537}' => (L, N, H, H), // ┷
+        '\u{2538}' => (H, N, L, L), // ┸
+        '\u{2539}' => (H, N, H, L), // ┹
+        '\u{253A}' => (H, N, L, H), // ┺
+        '\u{253B}' => (H, N, H, H), // ┻
+        '\u{253C}' => (L, L, L, L), // ┼
+        '\u{253D}' => (L, L, H, L), // ┽
+        '\u{253E}' => (L, L, L, H), // ┾
+        '\u{253F}' => (L, L, H, H), // ┿
+        '\u{2540}' => (H, L, L, L), // ╀
+        '\u{2541}' => (L, H, L, L), // ╁
+        '\u{2542}' => (H, H, L, L), // ╂
+        '\u{2543}' => (H, L, H, L), // ╃
+        '\u{2544}' => (H, L, L, H), // ╄
+        '\u{2545}' => (L, H, H, L), // ╅
+        '\u{2546}' => (L, H, L, H), // ╆
+        '\u{2547}' => (H, L, H, H), // ╇
+        '\u{2548}' => (L, H, H, H), // ╈
+        '\u{2549}' => (H, H, H, L), // ╉
+        '\u{254A}' => (H, H, L, H), // ╊
+        '\u{254B}' => (H, H, H, H), // ╋
+        '\u{2550}' => (N, N, D, D), // ═
+        '\u{2551}' => (D, D, N, N), // ║
+        '\u{2552}' => (N, L, N, D), // ╒
+        '\u{2553}' => (N, D, N, L), // ╓
+        '\u{2554}' => (N, D, N, D), // ╔
+        '\u{2555}' => (N, L, D, N), // ╕
+        '\u{2556}' => (N, D, L, N), // ╖
+        '\u{2557}' => (N, D, D, N), // ╗
+        '\u{2558}' => (L, N, N, D), // ╘
+        '\u{2559}' => (D, N, N, L), // ╙
+        '\u{255A}' => (D, N, N, D), // ╚
+        '\u{255B}' => (L, N, D, N), // ╛
+        '\u{255C}' => (D, N, L, N), // ╜
+        '\u{255D}' => (D, N, D, N), // ╝
+        '\u{255E}' => (L, L, N, D), // ╞
+        '\u{255F}' => (D, D, N, L), // ╟
+        '\u{2560}' => (D, D, N, D), // ╠
+        '\u{2561}' => (L, L, D, N), // ╡
+        '\u{2562}' => (D, D, L, N), // ╢
+        '\u{2563}' => (D, D, D, N), // ╣
+        '\u{2564}' => (N, L, D, D), // ╤
+        '\u{2565}' => (N, D, L, L), // ╥
+        '\u{2566}' => (N, D, D, D), // ╦
+        '\u{2567}' => (L, N, D, D), // ╧
+        '\u{2568}' => (D, N, L, L), // ╨
+        '\u{2569}' => (D, N, D, D), // ╩
+        '\u{256A}' => (L, L, D, D), // ╪
+        '\u{256B}' => (D, D, L, L), // ╫
+        '\u{256C}' => (D, D, D, D), // ╬
+        '\u{2574}' => (N, N, L, N), // ╴
+        '\u{2575}' => (L, N, N, N), // ╵
+        '\u{2576}' => (N, N, N, L), // ╶
+        '\u{2577}' => (N, L, N, N), // ╷
+        '\u{2578}' => (N, N, H, N), // ╸
+        '\u{2579}' => (H, N, N, N), // ╹
+        '\u{257A}' => (N, N, N, H), // ╺
+        '\u{257B}' => (N, H, N, N), // ╻
+        '\u{257C}' => (N, N, L, H), // ╼
+        '\u{257D}' => (L, H, N, N), // ╽
+        '\u{257E}' => (N, N, H, L), // ╾
+        '\u{257F}' => (H, L, N, N), // ╿
+        _ => return None,
+    })
+}
+
+/// Rectangles covering the strokes of a box drawing character, as
+/// (x, y), (width, height) fractions of the cell with y measured from the top.
+///
+/// Must only be called for characters where [`is_box_drawing`] is true.
+///
+/// Strokes run between cell edge midpoints so that borders continue
+/// seamlessly across cells, no matter which font is configured. The light
+/// stroke thickness is one eighth of the cell width, like a hand-rasterized
+/// reference implementation; heavy strokes are twice as thick.
+pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f32; 2], [f32; 2])> {
+    use Stroke::{Double, None};
+
+    let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+
+    let stroke = (cell_width / 8.0).round().max(1.0);
+    let heavy = 2.0 * stroke;
+    // Distance between the cell center and the center of each line of a
+    // double stroke.
+    let double_gap = stroke / 2.0 + 1.0;
+    let xc = cell_width / 2.0;
+    let yc = cell_height / 2.0;
+
+    match c {
+        '\u{2504}' | '\u{2505}' | '\u{2508}' | '\u{2509}' | '\u{254C}' | '\u{254D}' => {
+            let (num_gaps, thickness) = match c {
+                '\u{2505}' | '\u{2509}' | '\u{254D}' => (dash_num_gaps(c), heavy),
+                _ => (dash_num_gaps(c), stroke),
+            };
+            for (x, len) in dash_segments(cell_width, num_gaps) {
+                rects.push((x, yc - thickness / 2.0, len, thickness));
+            }
+        }
+        '\u{2506}' | '\u{2507}' | '\u{250A}' | '\u{250B}' | '\u{254E}' | '\u{254F}' => {
+            let (num_gaps, thickness) = match c {
+                '\u{2507}' | '\u{250B}' | '\u{254F}' => (dash_num_gaps(c), heavy),
+                _ => (dash_num_gaps(c), stroke),
+            };
+            for (y, len) in dash_segments(cell_height, num_gaps) {
+                rects.push((xc - thickness / 2.0, y, thickness, len));
+            }
+        }
+        // Rounded corners: '╭', '╮', '╯', '╰'. A quarter ellipse around the
+        // corner shared by the two stroked edges, connecting the horizontal
+        // and vertical edge midpoints.
+        '\u{256D}'..='\u{2570}' => {
+            // The corner point and the signs pointing from it into the cell.
+            let (cx, cy) = match c {
+                '\u{256D}' => (cell_width, cell_height), // ╭
+                '\u{256E}' => (0.0, cell_height),        // ╮
+                '\u{256F}' => (0.0, 0.0),                // ╯
+                _ => (cell_width, 0.0),                  // ╰
+            };
+            let sx = if cx == 0.0 { 1.0 } else { -1.0 };
+            let sy = if cy == 0.0 { 1.0 } else { -1.0 };
+            let point = |rx: f32, ry: f32, angle: f32| {
+                (cx + sx * rx * angle.cos(), cy + sy * ry * angle.sin())
+            };
+            let (rx, ry) = (xc, yc);
+            let (irx, iry) = (
+                (rx - stroke).max(stroke / 2.0),
+                (ry - stroke).max(stroke / 2.0),
+            );
+            let steps = (((rx + ry) / 3.0).round() as i32).clamp(4, 16) as usize;
+            let mut prev_outer = point(rx, ry, 0.0);
+            let mut prev_inner = point(irx, iry, 0.0);
+            for i in 1..=steps {
+                let angle = std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
+                let outer = point(rx, ry, angle);
+                let inner = point(irx, iry, angle);
+                let x0 = prev_outer.0.min(prev_inner.0).min(outer.0).min(inner.0);
+                let x1 = prev_outer.0.max(prev_inner.0).max(outer.0).max(inner.0);
+                let y0 = prev_outer.1.min(prev_inner.1).min(outer.1).min(inner.1);
+                let y1 = prev_outer.1.max(prev_inner.1).max(outer.1).max(inner.1);
+                rects.push((x0, y0, x1 - x0, y1 - y0));
+                prev_outer = outer;
+                prev_inner = inner;
+            }
+            // End caps, so the arc meets neighboring line characters flush.
+            rects.push((xc - stroke / 2.0, cy.min(cy + sy * stroke), stroke, stroke));
+            rects.push((cx.min(cx + sx * stroke), yc - stroke / 2.0, stroke, stroke));
+        }
+        _ => {
+            let Some((up, down, left, right)) = box_drawing_arms(c) else {
+                return Vec::new();
+            };
+
+            let v_double = up == Double || down == Double;
+            let h_double = left == Double || right == Double;
+            // At a corner, a stroke meeting a double stroke on the other axis
+            // runs through the gap between its two lines; at a junction it
+            // stops at the outer edge of the nearer line, like font glyphs.
+            let v_corner = (up == None) != (down == None);
+            let h_corner = (left == None) != (right == None);
+
+            if up != None || down != None {
+                // A lone vertical arm runs between the cell center and its
+                // edge, or to (through) the lines of a double horizontal
+                // stroke it meets.
+                let top = if up != None {
+                    0.0
+                } else if h_double {
+                    if h_corner {
+                        yc - double_gap + stroke / 2.0
+                    } else {
+                        yc + double_gap + stroke / 2.0
+                    }
+                } else {
+                    yc
+                };
+                let bottom = if down != None {
+                    cell_height
+                } else if h_double {
+                    if h_corner {
+                        yc + double_gap - stroke / 2.0
+                    } else {
+                        yc - double_gap - stroke / 2.0
+                    }
+                } else {
+                    yc
+                };
+                if up == down {
+                    for (pos, thickness) in stroke_bands(up, xc, stroke, double_gap) {
+                        rects.push((pos, 0.0, thickness, cell_height));
+                    }
+                } else {
+                    for (pos, thickness) in stroke_bands(up, xc, stroke, double_gap) {
+                        rects.push((pos, 0.0, thickness, bottom.min(cell_height)));
+                    }
+                    for (pos, thickness) in stroke_bands(down, xc, stroke, double_gap) {
+                        rects.push((pos, top, thickness, cell_height - top));
+                    }
+                }
+            }
+
+            if left != None || right != None {
+                // A lone horizontal arm runs between the cell center and its
+                // edge, or to (through) the lines of a double vertical stroke
+                // it meets.
+                let x0 = if left != None {
+                    0.0
+                } else if v_double {
+                    if v_corner {
+                        xc - double_gap + stroke / 2.0
+                    } else {
+                        xc + double_gap + stroke / 2.0
+                    }
+                } else {
+                    xc
+                };
+                let x1 = if right != None {
+                    cell_width
+                } else if v_double {
+                    if v_corner {
+                        xc + double_gap - stroke / 2.0
+                    } else {
+                        xc - double_gap - stroke / 2.0
+                    }
+                } else {
+                    xc
+                };
+                if left == right {
+                    for (pos, thickness) in stroke_bands(left, yc, stroke, double_gap) {
+                        rects.push((0.0, pos, cell_width, thickness));
+                    }
+                } else {
+                    for (pos, thickness) in stroke_bands(left, yc, stroke, double_gap) {
+                        rects.push((0.0, pos, x1, thickness));
+                    }
+                    for (pos, thickness) in stroke_bands(right, yc, stroke, double_gap) {
+                        rects.push((x0, pos, cell_width - x0, thickness));
+                    }
+                }
+            }
+        }
+    }
+
+    rects
+        .into_iter()
+        .map(|(x, y, width, height)| {
+            // Clamp, so that float error on the arc slices cannot spill
+            // rectangles past the cell into its neighbors.
+            let x = x.clamp(0.0, cell_width);
+            let y = y.clamp(0.0, cell_height);
+            (
+                [x / cell_width, y / cell_height],
+                [
+                    width.min(cell_width - x).max(0.0) / cell_width,
+                    height.min(cell_height - y).max(0.0) / cell_height,
+                ],
+            )
+        })
+        .filter(|&(_, size)| size[0] > 0.0 && size[1] > 0.0)
+        .collect()
+}
+
+fn dash_num_gaps(c: char) -> usize {
+    match c {
+        '\u{2504}' | '\u{2505}' | '\u{2506}' | '\u{2507}' => 2, // triple dash
+        '\u{2508}' | '\u{2509}' | '\u{250A}' | '\u{250B}' => 3, // quadruple dash
+        _ => 1,                                                 // double dash
+    }
+}
+
+fn dash_segments(total: f32, num_gaps: usize) -> impl Iterator<Item = (f32, f32)> {
+    let gap = (total / 8.0).floor().max(1.0);
+    let dash = ((total - gap * num_gaps as f32) / (num_gaps as f32 + 1.0))
+        .floor()
+        .max(1.0);
+    (0..=num_gaps).map(move |i| {
+        let start = (i as f32 * (dash + gap)).min(total - dash).max(0.0);
+        let len = dash.min((total - start).max(0.0));
+        (start, len)
+    })
+}
+
+fn stroke_bands(
+    style: Stroke,
+    center: f32,
+    stroke: f32,
+    double_gap: f32,
+) -> impl Iterator<Item = (f32, f32)> {
+    let bands: [(f32, f32); 2] = match style {
+        Stroke::None => [(0.0, 0.0); 2],
+        Stroke::Light => [(center - stroke / 2.0, stroke), (0.0, 0.0)],
+        Stroke::Heavy => [(center - stroke, 2.0 * stroke), (0.0, 0.0)],
+        Stroke::Double => [
+            (center - double_gap - stroke / 2.0, stroke),
+            (center + double_gap - stroke / 2.0, stroke),
+        ],
+    };
+    bands.into_iter().filter(|&(_, thickness)| thickness > 0.0)
+}
+
 impl Metadata {
     fn new(bg: cosmic_text::Color, underline_color: cosmic_text::Color) -> Self {
         let flags = Flags::empty();
@@ -240,6 +709,7 @@ pub struct Terminal {
     pub context_menu: Option<MenuState>,
     pub metadata_set: IndexSet<Metadata>,
     pub needs_update: bool,
+    pub builtin_glyphs: Vec<BuiltinGlyph>,
     pub profile_id_opt: Option<ProfileId>,
     pub tab_title_override: Option<String>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
@@ -345,6 +815,7 @@ impl Terminal {
             active_hyperlink_id: None,
             url_regex_search: url_regex_search(),
             regex_matches: Vec::new(),
+            builtin_glyphs: Vec::new(),
             bold_font_weight: Weight(bold_font_weight),
             buffer: Arc::new(buffer),
             colors,
@@ -774,6 +1245,7 @@ impl Terminal {
 
         // Only keep default
         self.metadata_set.truncate(1);
+        self.builtin_glyphs.clear();
 
         //TODO: is redraw needed after all events?
         //TODO: use LineDamageBounds
@@ -839,8 +1311,11 @@ impl Terminal {
 
                     let start = text.len();
                     // Tab skip/stop is handled by alacritty_terminal
+                    // Block elements are drawn as quads by terminal_box, so replace
+                    // them with spaces to keep the buffer layout unchanged
                     text.push(match indexed.cell.c {
                         '\t' => ' ',
+                        c if is_builtin_glyph(c) => ' ',
                         c => c,
                     });
                     if let Some(zerowidth) = indexed.cell.zerowidth() {
@@ -962,6 +1437,15 @@ impl Terminal {
                         .with_underline_color(underline_color);
                     let (meta_idx, _) = self.metadata_set.insert_full(metadata);
                     attrs = attrs.metadata(meta_idx);
+
+                    if is_builtin_glyph(indexed.cell.c) {
+                        self.builtin_glyphs.push(BuiltinGlyph {
+                            line: line_i,
+                            column: indexed.point.column.0,
+                            c: indexed.cell.c,
+                            color: fg,
+                        });
+                    }
 
                     //TODO: more flags
                     if indexed.cell.flags.contains(Flags::BOLD) {
@@ -1275,5 +1759,198 @@ impl Drop for Terminal {
         if let Err(err) = self.notifier.0.send(Msg::Shutdown) {
             log::warn!("Failed to send shutdown message on dropped terminal: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_block_elements_have_valid_rects() {
+        for cp in 0x2580..=0x259F {
+            let c = char::from_u32(cp).unwrap();
+            assert!(is_block_element(c), "{c:?} should be a block element");
+
+            for &(pos, size) in block_element_rects(c) {
+                assert!(size[0] > 0.0 && size[1] > 0.0, "{c:?} rect not empty");
+                assert!(pos[0] >= 0.0 && pos[1] >= 0.0, "{c:?} rect starts in cell");
+                assert!(
+                    pos[0] + size[0] <= 1.0 && pos[1] + size[1] <= 1.0,
+                    "{c:?} rect ends in cell"
+                );
+            }
+
+            match c {
+                '\u{2591}' | '\u{2592}' | '\u{2593}' => {
+                    assert_eq!(block_element_rects(c), &[([0.0, 0.0], [1.0, 1.0])]);
+                }
+                _ => assert_eq!(block_element_alpha(c), 1.0),
+            }
+        }
+
+        let area = |c: char| -> f32 {
+            block_element_rects(c)
+                .iter()
+                .map(|&(_, size)| size[0] * size[1])
+                .sum()
+        };
+        assert_eq!(area('\u{2580}'), 0.5); // ▀
+        assert_eq!(area('\u{2588}'), 1.0); // █
+        assert_eq!(area('\u{258C}'), 0.5); // ▌
+        assert_eq!(area('\u{2598}'), 0.25); // ▘
+        assert_eq!(area('\u{259F}'), 0.75); // ▟
+        // Vertical eighths from ▁ up to █ fill the cell in steps
+        for (i, c) in ('\u{2581}'..='\u{2588}').enumerate() {
+            assert_eq!(area(c), (i + 1) as f32 / 8.0);
+        }
+    }
+
+    #[test]
+    fn half_blocks_tile_seamlessly() {
+        // The bottom edge of an upper half block must meet the top edge of a
+        // lower half block in the row below exactly at the cell boundary
+        let (upper_pos, upper_size) = block_element_rects('\u{2580}')[0];
+        assert_eq!((upper_pos, upper_size), ([0.0, 0.0], [1.0, 0.5]));
+        let (lower_pos, lower_size) = block_element_rects('\u{2584}')[0];
+        assert_eq!((lower_pos, lower_size), ([0.0, 0.5], [1.0, 0.5]));
+        assert_eq!(upper_pos[1] + upper_size[1], lower_pos[1]);
+
+        assert_eq!(block_element_rects('\u{2588}')[0], ([0.0, 0.0], [1.0, 1.0]));
+        assert_eq!(block_element_alpha('\u{2591}'), 0.25);
+        assert_eq!(block_element_alpha('\u{2592}'), 0.5);
+        assert_eq!(block_element_alpha('\u{2593}'), 0.75);
+    }
+
+    #[test]
+    fn builtin_glyph_coverage() {
+        // Everything but the diagonals is drawn by the terminal itself
+        for cp in 0x2500..=0x259F {
+            let c = char::from_u32(cp).unwrap();
+            assert_eq!(is_builtin_glyph(c), !matches!(c, '\u{2571}'..='\u{2573}'));
+        }
+        assert!(!is_builtin_glyph('a'));
+        assert!(!is_builtin_glyph('╱'));
+    }
+
+    #[test]
+    fn box_drawing_rects_stay_in_cell() {
+        for cp in 0x2500..=0x257F {
+            let c = char::from_u32(cp).unwrap();
+            if !is_box_drawing(c) {
+                continue;
+            }
+            for &(pos, size) in &box_drawing_rects(c, 9.0, 21.0) {
+                assert!(size[0] > 0.0 && size[1] > 0.0, "{c:?} rect not empty");
+                assert!(pos[0] >= 0.0 && pos[1] >= 0.0, "{c:?} rect starts in cell");
+                assert!(
+                    pos[0] + size[0] <= 1.0 + 1e-5 && pos[1] + size[1] <= 1.0 + 1e-5,
+                    "{c:?} rect ends in cell"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn box_drawing_lines_reach_cell_edges() {
+        // With a 9x21 cell the light stroke is 1px and the heavy stroke 2px.
+        let rects = |c: char| box_drawing_rects(c, 9.0, 21.0);
+
+        assert_eq!(
+            rects('\u{2503}'),
+            vec![([3.5 / 9.0, 0.0], [2.0 / 9.0, 1.0])]
+        );
+        assert_eq!(
+            rects('\u{2502}'),
+            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 1.0])]
+        );
+        assert_eq!(
+            rects('\u{2500}'),
+            vec![([0.0, 10.0 / 21.0], [1.0, 1.0 / 21.0])]
+        );
+        assert_eq!(
+            rects('\u{2501}'),
+            vec![([0.0, 9.5 / 21.0], [1.0, 2.0 / 21.0])]
+        );
+        assert_eq!(
+            rects('\u{2551}'),
+            vec![
+                ([2.5 / 9.0, 0.0], [1.0 / 9.0, 1.0]),
+                ([5.5 / 9.0, 0.0], [1.0 / 9.0, 1.0]),
+            ]
+        );
+
+        // Corners and half lines meet the edges they point at: ┌ reaches the
+        // bottom and the right edge, ╵ only the top half of the vertical
+        let corner = rects('\u{250C}');
+        assert_eq!(corner.len(), 2);
+        assert!(corner.iter().any(|&(_, size)| size == [1.0 / 9.0, 0.5]));
+        assert!(corner.iter().any(|&(_, size)| size == [0.5, 1.0 / 21.0]));
+        assert_eq!(
+            rects('\u{2575}'),
+            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 0.5])]
+        );
+    }
+
+    #[test]
+    fn box_drawing_lines_tile_seamlessly() {
+        let cw = 9.0;
+        let ch = 21.0;
+
+        assert_eq!(box_drawing_rects('\u{2504}', cw, ch).len(), 3); // ┄ triple
+        assert_eq!(box_drawing_rects('\u{2508}', cw, ch).len(), 4); // ┈ quadruple
+        assert_eq!(box_drawing_rects('\u{254C}', cw, ch).len(), 2); // ╌ double
+
+        // Every vertical stroke of the vertical line and dash characters is
+        // centered on the cell's horizontal center line, so borders mixing
+        // them keep their columns aligned.
+        for c in [
+            '\u{2502}', '\u{2503}', '\u{2506}', '\u{2507}', '\u{250A}', '\u{250B}', '\u{254E}',
+            '\u{254F}', '\u{2551}',
+        ] {
+            let centers: Vec<f32> = box_drawing_rects(c, cw, ch)
+                .iter()
+                .map(|&(pos, size)| pos[0] + size[0] / 2.0)
+                .collect();
+            let mid = centers.iter().sum::<f32>() / centers.len() as f32;
+            assert!((mid - 0.5).abs() < 1e-5, "{c:?} strokes centered");
+        }
+        for c in [
+            '\u{2500}', '\u{2501}', '\u{2504}', '\u{2505}', '\u{2508}', '\u{2509}', '\u{254C}',
+            '\u{254D}', '\u{2550}',
+        ] {
+            let centers: Vec<f32> = box_drawing_rects(c, cw, ch)
+                .iter()
+                .map(|&(pos, size)| pos[1] + size[1] / 2.0)
+                .collect();
+            let mid = centers.iter().sum::<f32>() / centers.len() as f32;
+            assert!((mid - 0.5).abs() < 1e-5, "{c:?} strokes centered");
+        }
+
+        // A single stroke meeting a double stroke stops at its outer edge:
+        // ╤'s stem starts below the lower line of the double horizontal and
+        // runs to the bottom edge, leaving the gap between the lines open.
+        let stem = box_drawing_rects('\u{2564}', cw, ch)
+            .into_iter()
+            .find(|&(_, size)| size[0] < 0.2)
+            .unwrap();
+        assert!(stem.0[1] > 0.5, "stem starts below the cell center");
+        assert_eq!(stem.0[1] + stem.1[1], 1.0, "stem runs to the bottom edge");
+    }
+
+    #[test]
+    fn box_drawing_arcs_connect_edge_midpoints() {
+        // ╰ connects the vertical stroke of the cell above (at the horizontal
+        // center) with the horizontal stroke of the cell to its right (at the
+        // vertical center).
+        let rects = box_drawing_rects('\u{2570}', 9.0, 21.0);
+        assert!(rects.iter().any(|&(pos, size)| {
+            let cx = pos[0] + size[0] / 2.0;
+            pos[1] == 0.0 && (cx - 0.5).abs() < 0.01 && size[1] > 0.0
+        }));
+        assert!(rects.iter().any(|&(pos, size)| {
+            let cy = pos[1] + size[1] / 2.0;
+            pos[0] + size[0] > 0.99 && (cy - 0.5).abs() < 0.01 && size[0] > 0.0
+        }));
     }
 }
