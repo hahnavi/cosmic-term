@@ -49,9 +49,7 @@ use std::{
 use crate::{
     Action, Terminal, TerminalScroll,
     menu::MenuState,
-    terminal::{
-        Metadata, block_element_alpha, block_element_rects, box_drawing_rects, is_block_element,
-    },
+    terminal::{Metadata, builtin_glyph_rects},
 };
 
 const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -749,24 +747,10 @@ where
                     f32::from(glyph.color.b()) / 255.0,
                     f32::from(glyph.color.a()) / 255.0,
                 );
-                let rects: Vec<([f32; 2], [f32; 2], f32)> = if is_block_element(glyph.c) {
-                    block_element_rects(glyph.c)
-                        .iter()
-                        .map(|&(pos, size)| (pos, size, 1.0))
-                        .collect()
-                } else {
-                    box_drawing_rects(glyph.c, cell_width, cell_height)
-                };
-                // Shade blocks fade the whole glyph; antialiased diagonals
-                // carry their coverage per rectangle instead.
-                let glyph_alpha = if is_block_element(glyph.c) {
-                    block_element_alpha(glyph.c)
-                } else {
-                    1.0
-                };
+                let rects = builtin_glyph_rects(glyph.c, cell_width, cell_height);
                 for &(pos, size, alpha) in rects.iter() {
                     let color = Color {
-                        a: color.a * glyph_alpha * alpha,
+                        a: color.a * alpha,
                         ..color
                     };
                     // Round shared edges identically so adjacent cells tile without seams

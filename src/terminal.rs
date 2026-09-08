@@ -30,7 +30,7 @@ use std::{
     fs, io, mem,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU32, Ordering},
     },
     time::Instant,
@@ -230,24 +230,50 @@ pub struct BuiltinGlyph {
 /// Whether the character is drawn by the terminal itself, as rectangles at
 /// exact cell geometry, instead of a font glyph.
 ///
-/// Covers block elements and all box drawing characters, including the
-/// diagonals, which are approximated with antialiased rectangle coverage.
+/// Covers block elements and segment blocks, sextant mosaics, all box
+/// drawing characters including the diagonals and rounded corners, and the
+/// powerline symbols.
 pub fn is_builtin_glyph(c: char) -> bool {
-    is_block_element(c) || is_box_drawing(c)
+    is_block_element(c)
+        || is_segment_block(c)
+        || is_sextant(c)
+        || is_box_drawing(c)
+        || is_powerline(c)
 }
 
 pub fn is_block_element(c: char) -> bool {
     matches!(c, '\u{2580}'..='\u{259F}')
 }
 
+/// Symbols for Legacy Computing segment blocks, which complement the block
+/// elements with the partial blocks anchored at the top and right edge that
+/// have no Block Elements code point.
+pub fn is_segment_block(c: char) -> bool {
+    matches!(c, '\u{1FB82}'..='\u{1FB8B}')
+}
+
+/// Symbols for Legacy Computing sextant mosaics, which subdivide the cell
+/// into a 2x3 grid.
+pub fn is_sextant(c: char) -> bool {
+    matches!(c, '\u{1FB00}'..='\u{1FB3B}')
+}
+
+/// Powerline symbols drawn by the terminal so that prompt segments join
+/// seamlessly regardless of the configured font.
+pub fn is_powerline(c: char) -> bool {
+    matches!(c, '\u{E0B0}'..='\u{E0B3}')
+}
+
 pub fn is_box_drawing(c: char) -> bool {
     matches!(c, '\u{2500}'..='\u{257F}')
 }
 
-/// Rectangles covering the filled fraction of a block element cell, as
-/// (x, y), (width, height) fractions of the cell with y measured from the top.
+/// Rectangles covering the filled fraction of a block element or segment
+/// block cell, as (x, y), (width, height) fractions of the cell with y
+/// measured from the top.
 ///
-/// Must only be called for characters where [`is_block_element`] is true.
+/// Must only be called for characters where [`is_block_element`] or
+/// [`is_segment_block`] is true.
 pub fn block_element_rects(c: char) -> &'static [([f32; 2], [f32; 2])] {
     match c {
         '\u{2580}' => &[([0.0, 0.0], [1.0, 0.5])], // ▀ upper half
@@ -304,6 +330,19 @@ pub fn block_element_rects(c: char) -> &'static [([f32; 2], [f32; 2])] {
             ([0.5, 0.0], [0.5, 1.0]),
             ([0.0, 0.5], [0.5, 0.5]),
         ],
+        // Segment blocks, which extend the partial blocks anchored at the
+        // top and right edge to the fractions without a Block Elements
+        // code point.
+        '\u{1FB82}' => &[([0.0, 0.0], [1.0, 2.0 / 8.0])], // 🮂 upper one quarter
+        '\u{1FB83}' => &[([0.0, 0.0], [1.0, 3.0 / 8.0])], // 🮃 upper three eighths
+        '\u{1FB84}' => &[([0.0, 0.0], [1.0, 5.0 / 8.0])], // 🮄 upper five eighths
+        '\u{1FB85}' => &[([0.0, 0.0], [1.0, 6.0 / 8.0])], // 🮅 upper three quarters
+        '\u{1FB86}' => &[([0.0, 0.0], [1.0, 7.0 / 8.0])], // 🮆 upper seven eighths
+        '\u{1FB87}' => &[([6.0 / 8.0, 0.0], [2.0 / 8.0, 1.0])], // 🮇 right one quarter
+        '\u{1FB88}' => &[([5.0 / 8.0, 0.0], [3.0 / 8.0, 1.0])], // 🮈 right three eighths
+        '\u{1FB89}' => &[([3.0 / 8.0, 0.0], [5.0 / 8.0, 1.0])], // 🮉 right five eighths
+        '\u{1FB8A}' => &[([2.0 / 8.0, 0.0], [6.0 / 8.0, 1.0])], // 🮊 right three quarters
+        '\u{1FB8B}' => &[([1.0 / 8.0, 0.0], [7.0 / 8.0, 1.0])], // 🮋 right seven eighths
         _ => &[],
     }
 }
@@ -318,6 +357,44 @@ pub fn block_element_alpha(c: char) -> f32 {
         '\u{2593}' => 0.75, // ▓ dark shade
         _ => 1.0,
     }
+}
+
+/// Rectangles covering the filled cells of a sextant mosaic, as fractions
+/// of the cell.
+///
+/// The cell is divided into a 2x3 grid; the characters count through the
+/// subsets of the six cells in binary order, with the cells weighted
+/// upper-left = 1, upper-right = 2, middle-left = 4, middle-right = 8,
+/// bottom-left = 16 and bottom-right = 32. The empty mosaic, the two
+/// checkerboards and the full mosaic have no code point assigned and are
+/// skipped by the count, as laid out by the Unicode names `BLOCK
+/// SEXTANT-N`, whose digits enumerate the filled cells in reading order.
+///
+/// Must only be called for characters where [`is_sextant`] is true.
+fn sextant_rects(c: char) -> Vec<([f32; 2], [f32; 2])> {
+    let mut mask = c as u32 - 0x1FB00 + 1;
+    for skipped in [21, 42, 63] {
+        if mask >= skipped {
+            mask += 1;
+        }
+    }
+
+    const THIRD: f32 = 1.0 / 3.0;
+    const CELLS: [([f32; 2], [f32; 2]); 6] = [
+        ([0.0, 0.0], [0.5, THIRD]),         // upper left
+        ([0.5, 0.0], [0.5, THIRD]),         // upper right
+        ([0.0, THIRD], [0.5, THIRD]),       // middle left
+        ([0.5, THIRD], [0.5, THIRD]),       // middle right
+        ([0.0, 2.0 * THIRD], [0.5, THIRD]), // lower left
+        ([0.5, 2.0 * THIRD], [0.5, THIRD]), // lower right
+    ];
+
+    CELLS
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| (mask >> i) & 1 == 1)
+        .map(|(_, &cell)| cell)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,11 +704,22 @@ pub fn box_drawing_rects(
         }
     }
 
+    normalize_rects(rects, cell_width, cell_height)
+}
+
+/// Clamp pixel-unit rectangles to the cell and normalize them to cell
+/// fractions with y measured from the top, dropping empty ones.
+///
+/// Clamping keeps float error on the rasterized glyphs from spilling
+/// rectangles past the cell into its neighbors.
+fn normalize_rects(
+    rects: Vec<(f32, f32, f32, f32, f32)>,
+    cell_width: f32,
+    cell_height: f32,
+) -> Vec<([f32; 2], [f32; 2], f32)> {
     rects
         .into_iter()
         .map(|(x, y, width, height, alpha)| {
-            // Clamp, so that float error on the arc slices cannot spill
-            // rectangles past the cell into its neighbors.
             let x = x.clamp(0.0, cell_width);
             let y = y.clamp(0.0, cell_height);
             (
@@ -645,6 +733,160 @@ pub fn box_drawing_rects(
         })
         .filter(|&(_, size, _)| size[0] > 0.0 && size[1] > 0.0)
         .collect()
+}
+
+/// Whether the powerline symbols keep their shape at the given cell
+/// metrics. In cells much narrower than tall the diagonals are cut off too
+/// hard, and the configured font is used instead.
+pub fn powerline_fits(cell_width: f32, cell_height: f32) -> bool {
+    let width = cell_width.max(1.0) as i32;
+    let height = cell_height.max(1.0) as i32;
+    (height + 1) / 2 - 1 - width <= 1
+}
+
+/// Rectangles covering a powerline symbol, as fractions of the cell with y
+/// measured from the top.
+///
+/// Triangles fill the area between two diagonals stepped at one pixel per
+/// row; arrows draw the two diagonals as bands of light stroke thickness,
+/// connected by a vertical tip when the cell edge is reached before the
+/// diagonals meet. The right-to-left variants are horizontal mirrors of the
+/// left-to-right ones, like the hand-rasterized reference implementation,
+/// so powerline segments join seamlessly across cells.
+///
+/// Must only be called for characters where [`is_powerline`] is true.
+pub fn powerline_rects(
+    c: char,
+    cell_width: f32,
+    cell_height: f32,
+) -> Vec<([f32; 2], [f32; 2], f32)> {
+    let width = cell_width.max(1.0) as usize;
+    let height = cell_height.max(1.0) as usize;
+    // Inner lines make the arrow bands as thick as the box drawing light
+    // stroke.
+    let extra_thickness = (width as f32 / 8.0).round().max(1.0) as i32 - 1;
+
+    // The diagonals start one pixel inside the corners and meet one pixel
+    // above the vertical center, leaving the outermost rows empty.
+    let top_y = 1;
+    let bottom_y = height as i32 - 2;
+    let x_intersection = (height as i32 + 1) / 2 - 1;
+
+    let triangle = matches!(c, '\u{E0B0}' | '\u{E0B2}');
+    let right_to_left = matches!(c, '\u{E0B2}' | '\u{E0B3}');
+
+    let mut rects: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+    for x in 0..x_intersection {
+        let top = top_y + x;
+        let bottom = bottom_y - x;
+        if triangle {
+            // Runs grow with the distance from the corners until the
+            // diagonals meet; wider runs are clamped to the cell.
+            let run = (0.0, top as f32, (x + 1) as f32, 1.0, 1.0);
+            rects.push(run);
+            if bottom != top {
+                rects.push((0.0, bottom as f32, (x + 1) as f32, 1.0, 1.0));
+            }
+        } else if x + 1 == width as i32 {
+            // The cell ends before the diagonals meet; connect them with
+            // the arrow tip.
+            rects.push((x as f32, top as f32, 1.0, (bottom - top + 1) as f32, 1.0));
+            break;
+        } else {
+            // The inner lines run ahead of the outer ones by the extra
+            // thickness; past the intersection each band spans between the
+            // two diagonals, merging the strokes at the tip.
+            let inner_top = if x + extra_thickness < x_intersection {
+                top + extra_thickness
+            } else {
+                bottom
+            };
+            let inner_bottom = if x + extra_thickness < x_intersection {
+                bottom - extra_thickness
+            } else {
+                top
+            };
+            let upper_band = (x as f32, top as f32, 1.0, (inner_top - top + 1) as f32, 1.0);
+            let lower_band = (
+                x as f32,
+                inner_bottom as f32,
+                1.0,
+                (bottom - inner_bottom + 1) as f32,
+                1.0,
+            );
+            rects.push(upper_band);
+            if lower_band != upper_band {
+                rects.push(lower_band);
+            }
+        }
+    }
+
+    if right_to_left {
+        for rect in &mut rects {
+            rect.0 = width as f32 - rect.0 - rect.2;
+        }
+    }
+
+    normalize_rects(rects, cell_width, cell_height)
+}
+
+/// A rectangle covering part of a cell, as (x, y), (width, height)
+/// fractions of the cell with y measured from the top, and the alpha with
+/// which it is drawn.
+pub type CellRect = ([f32; 2], [f32; 2], f32);
+
+/// Cached builtin glyph rectangles, keyed by character and cell metrics.
+type RectCache = HashMap<(char, u32, u32), Arc<[CellRect]>>;
+
+/// Rectangles covering a builtin glyph, cached per character and cell
+/// metrics.
+///
+/// Shade block elements fade the whole glyph to approximate their fill
+/// density; the antialiased box drawing glyphs and powerline symbols carry
+/// their coverage per rectangle.
+///
+/// Must only be called for characters where [`is_builtin_glyph`] is true.
+pub fn builtin_glyph_rects(c: char, cell_width: f32, cell_height: f32) -> Arc<[CellRect]> {
+    // The geometry is cheap to build, but a full screen of TUI borders asks
+    // for it every frame; cache it per character and cell metrics, which
+    // only change with the font.
+    static CACHE: OnceLock<Mutex<RectCache>> = OnceLock::new();
+    let key = (c, cell_width.to_bits(), cell_height.to_bits());
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(rects) = map.get(&key) {
+        return Arc::clone(rects);
+    }
+
+    let rects: Arc<[CellRect]> = if is_block_element(c) || is_segment_block(c) {
+        Arc::from(
+            block_element_rects(c)
+                .iter()
+                .map(|&(pos, size)| (pos, size, block_element_alpha(c)))
+                .collect::<Vec<_>>(),
+        )
+    } else if is_sextant(c) {
+        Arc::from(
+            sextant_rects(c)
+                .into_iter()
+                .map(|(pos, size)| (pos, size, 1.0))
+                .collect::<Vec<_>>(),
+        )
+    } else if is_powerline(c) {
+        Arc::from(powerline_rects(c, cell_width, cell_height))
+    } else {
+        Arc::from(box_drawing_rects(c, cell_width, cell_height))
+    };
+
+    // Clear the cache if pathological metric churn ever grows it.
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.insert(key, Arc::clone(&rects));
+    rects
 }
 
 /// Push the antialiased coverage rectangles of a line segment from
@@ -1484,6 +1726,15 @@ impl Terminal {
         self.metadata_set.truncate(1);
         self.builtin_glyphs.clear();
 
+        // Powerline symbols are only drawn by the terminal when they keep
+        // their shape at the cell metrics; otherwise the font's glyphs are
+        // used, like the hand-rasterized reference implementation.
+        let size = self.size();
+        let builtin = |c: char| {
+            is_builtin_glyph(c)
+                && (!is_powerline(c) || powerline_fits(size.cell_width, size.cell_height))
+        };
+
         //TODO: is redraw needed after all events?
         //TODO: use LineDamageBounds
         {
@@ -1548,11 +1799,12 @@ impl Terminal {
 
                     let start = text.len();
                     // Tab skip/stop is handled by alacritty_terminal
-                    // Block elements are drawn as quads by terminal_box, so replace
-                    // them with spaces to keep the buffer layout unchanged
+                    // Builtin glyphs are drawn as quads by terminal_box, so
+                    // replace them with spaces to keep the buffer layout
+                    // unchanged
                     text.push(match indexed.cell.c {
                         '\t' => ' ',
-                        c if is_builtin_glyph(c) => ' ',
+                        c if builtin(c) => ' ',
                         c => c,
                     });
                     if let Some(zerowidth) = indexed.cell.zerowidth() {
@@ -1675,7 +1927,7 @@ impl Terminal {
                     let (meta_idx, _) = self.metadata_set.insert_full(metadata);
                     attrs = attrs.metadata(meta_idx);
 
-                    if is_builtin_glyph(indexed.cell.c) {
+                    if builtin(indexed.cell.c) {
                         self.builtin_glyphs.push(BuiltinGlyph {
                             line: line_i,
                             column: indexed.point.column.0,
@@ -2061,14 +2313,27 @@ mod tests {
 
     #[test]
     fn builtin_glyph_coverage() {
-        // All box drawing characters, including the diagonals, and all block
-        // elements are drawn by the terminal itself
-        for cp in 0x2500..=0x259F {
+        // All box drawing characters, including the diagonals, all block
+        // elements and segment blocks, the sextant mosaics and the powerline
+        // symbols are drawn by the terminal itself
+        for cp in (0x2500..=0x259F)
+            .chain(0x1FB00..=0x1FB3B)
+            .chain(0x1FB82..=0x1FB8B)
+        {
             let c = char::from_u32(cp).unwrap();
+            assert!(is_builtin_glyph(c), "{c:?} should be a builtin glyph");
+        }
+        for c in '\u{E0B0}'..='\u{E0B3}' {
             assert!(is_builtin_glyph(c), "{c:?} should be a builtin glyph");
         }
         assert!(!is_builtin_glyph('a'));
         assert!(!is_builtin_glyph('✓'));
+        // Neighboring Symbols for Legacy Computing and powerline code points
+        // stay font glyphs
+        for cp in [0x1FB3C, 0x1FB70, 0x1FB8C, 0xE0AF, 0xE0B4] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(!is_builtin_glyph(c), "{c:?} should be a font glyph");
+        }
     }
 
     #[test]
@@ -2393,5 +2658,275 @@ mod tests {
         // And it is the union of both single diagonals
         let single = |c: char| box_drawing_rects(c, 9.0, 21.0).len();
         assert_eq!(rects.len(), single('\u{2571}') + single('\u{2572}'));
+    }
+
+    #[test]
+    fn segment_blocks_fill_their_namesakes() {
+        let area = |c: char| -> f32 {
+            block_element_rects(c)
+                .iter()
+                .map(|&(_, size)| size[0] * size[1])
+                .sum()
+        };
+
+        for cp in 0x1FB82..=0x1FB8B {
+            let c = char::from_u32(cp).unwrap();
+            assert!(is_segment_block(c), "{c:?} should be a segment block");
+            assert_eq!(block_element_rects(c).len(), 1, "{c:?} is a single rect");
+            let &(pos, size) = &block_element_rects(c)[0];
+            assert!(
+                pos[0] >= 0.0
+                    && pos[1] >= 0.0
+                    && pos[0] + size[0] <= 1.0
+                    && pos[1] + size[1] <= 1.0,
+                "{c:?} rect stays in cell"
+            );
+            assert_eq!(block_element_alpha(c), 1.0);
+        }
+
+        // Upper blocks grow from a quarter to seven eighths, anchored at
+        // the top edge of the cell
+        for (i, c) in ('\u{1FB82}'..='\u{1FB86}').enumerate() {
+            let height = [2.0 / 8.0, 3.0 / 8.0, 5.0 / 8.0, 6.0 / 8.0, 7.0 / 8.0][i];
+            assert_eq!(
+                block_element_rects(c)[0],
+                ([0.0, 0.0], [1.0, height]),
+                "{c:?}"
+            );
+        }
+        // Right blocks are anchored at the right edge of the cell
+        for (i, c) in ('\u{1FB87}'..='\u{1FB8B}').enumerate() {
+            let width = [2.0 / 8.0, 3.0 / 8.0, 5.0 / 8.0, 6.0 / 8.0, 7.0 / 8.0][i];
+            let &(pos, size) = &block_element_rects(c)[0];
+            assert_eq!((size[0], size[1]), (width, 1.0), "{c:?}");
+            assert_eq!(pos[0] + size[0], 1.0, "{c:?} touches the right edge");
+        }
+
+        // Upper blocks complement the Block Elements lower blocks exactly,
+        // so stacks of them tile the cell without gaps or overlap
+        assert!((area('\u{1FB82}') + area('\u{2586}') - 1.0).abs() < 1e-6); // 🮂 + ▆
+        assert!((area('\u{1FB83}') + area('\u{2585}') - 1.0).abs() < 1e-6); // 🮃 + ▅
+        assert!((area('\u{1FB84}') + area('\u{2583}') - 1.0).abs() < 1e-6); // 🮄 + ▃
+        assert!((area('\u{1FB85}') + area('\u{2582}') - 1.0).abs() < 1e-6); // 🮅 + ▂
+        assert!((area('\u{1FB86}') + area('\u{2581}') - 1.0).abs() < 1e-6); // 🮆 + ▁
+    }
+
+    #[test]
+    fn sextants_match_their_unicode_names() {
+        // Reference grids derived from the Unicode names BLOCK SEXTANT-N,
+        // whose digits 1-6 enumerate the grid cells of the 2x3 mosaic in
+        // reading order
+        let cell = |digits: &str| {
+            const CELLS: [([f32; 2], [f32; 2]); 6] = [
+                ([0.0, 0.0], [0.5, 1.0 / 3.0]),
+                ([0.5, 0.0], [0.5, 1.0 / 3.0]),
+                ([0.0, 1.0 / 3.0], [0.5, 1.0 / 3.0]),
+                ([0.5, 1.0 / 3.0], [0.5, 1.0 / 3.0]),
+                ([0.0, 2.0 / 3.0], [0.5, 1.0 / 3.0]),
+                ([0.5, 2.0 / 3.0], [0.5, 1.0 / 3.0]),
+            ];
+            digits
+                .chars()
+                .map(|d| CELLS[d.to_digit(10).unwrap() as usize - 1])
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sextant_rects('\u{1FB00}'), cell("1")); // 🬀
+        assert_eq!(sextant_rects('\u{1FB01}'), cell("2")); // 🬁
+        assert_eq!(sextant_rects('\u{1FB02}'), cell("12")); // 🬂
+        assert_eq!(sextant_rects('\u{1FB03}'), cell("3")); // 🬃
+        assert_eq!(sextant_rects('\u{1FB07}'), cell("4")); // 🬇
+        assert_eq!(sextant_rects('\u{1FB0F}'), cell("5")); // 🬏
+        assert_eq!(sextant_rects('\u{1FB1E}'), cell("6")); // 🬞
+        assert_eq!(sextant_rects('\u{1FB14}'), cell("235")); // 🬔
+        assert_eq!(sextant_rects('\u{1FB1D}'), cell("12345")); // 🬝
+        assert_eq!(sextant_rects('\u{1FB3B}'), cell("23456")); // 🬻
+    }
+
+    #[test]
+    fn sextants_fill_whole_grid_cells() {
+        for cp in 0x1FB00..=0x1FB3B {
+            let c = char::from_u32(cp).unwrap();
+            let rects = sextant_rects(c);
+            // The empty, checkerboard and full mosaics have no code point,
+            // so every character fills between one and five cells
+            assert!(!rects.is_empty(), "{c:?} fills no cell");
+            assert!(rects.len() <= 5, "{c:?} fills more than five cells");
+
+            for &(pos, size) in &rects {
+                assert_eq!(size, [0.5, 1.0 / 3.0], "{c:?} fills a whole cell");
+                let column = (pos[0] * 2.0).round() as i32;
+                let row = (pos[1] * 3.0).round() as i32;
+                assert!(
+                    (0..2).contains(&column) && (0..3).contains(&row),
+                    "{c:?} rect {pos:?} snaps to the 2x3 grid"
+                );
+            }
+
+            // No cell is filled twice
+            let mut corners: Vec<_> = rects.iter().map(|&(pos, _)| pos).collect();
+            corners.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            corners.dedup_by(|a, b| a == b);
+            assert_eq!(corners.len(), rects.len(), "{c:?} fills a cell twice");
+
+            let area: f32 = rects.iter().map(|&(_, size)| size[0] * size[1]).sum();
+            assert!(
+                (area - rects.len() as f32 / 6.0).abs() < 1e-6,
+                "{c:?} covers {} sixths of the cell",
+                rects.len()
+            );
+        }
+    }
+
+    #[test]
+    fn powerline_triangles_match_hand_rasterized_reference() {
+        // At 5x7 the diagonals start one pixel inside the corners, the runs
+        // grow with the distance from them and meet in the middle row
+        let mut rects = powerline_rects('\u{E0B0}', 5.0, 7.0);
+        rects.sort_by(|a, b| (a.0[1], a.0[0]).partial_cmp(&(b.0[1], b.0[0])).unwrap());
+        let expected: Vec<([f32; 2], [f32; 2], f32)> =
+            [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (2.0, 4.0), (1.0, 5.0)]
+                .iter()
+                .map(|&(w, y)| ([0.0, y / 7.0], [w / 5.0, 1.0 / 7.0], 1.0))
+                .collect();
+        assert_eq!(rects, expected);
+
+        // At 3x7 the widest runs are clamped to the cell width
+        let mut rects = powerline_rects('\u{E0B0}', 3.0, 7.0);
+        rects.sort_by(|a, b| (a.0[1], a.0[0]).partial_cmp(&(b.0[1], b.0[0])).unwrap());
+        assert_eq!(rects[2].1[0], 1.0, "middle row spans the whole cell");
+    }
+
+    #[test]
+    fn powerline_arrows_match_hand_rasterized_reference() {
+        // At 5x7 with stroke 1 the arrow is a dotted chevron meeting at the
+        // center pixel
+        let mut rects = powerline_rects('\u{E0B1}', 5.0, 7.0);
+        rects.sort_by(|a, b| (a.0[1], a.0[0]).partial_cmp(&(b.0[1], b.0[0])).unwrap());
+        let expected: Vec<([f32; 2], [f32; 2], f32)> =
+            [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (1.0, 4.0), (0.0, 5.0)]
+                .iter()
+                .map(|&(x, y)| ([x / 5.0, y / 7.0], [1.0 / 5.0, 1.0 / 7.0], 1.0))
+                .collect();
+        assert_eq!(rects, expected);
+
+        // At 9x21 the diagonals reach the right edge before they meet and
+        // are connected by a vertical tip on the last column
+        let rects = powerline_rects('\u{E0B1}', 9.0, 21.0);
+        assert_eq!(rects.len(), 17);
+        assert!(
+            rects.iter().any(|&(pos, size, _)| {
+                (pos[0] - 8.0 / 9.0).abs() < 1e-6
+                    && (pos[1] - 9.0 / 21.0).abs() < 1e-6
+                    && (size[1] - 3.0 / 21.0).abs() < 1e-6
+            }),
+            "arrow tip connects the strokes on the last column"
+        );
+    }
+
+    #[test]
+    fn powerline_right_variants_mirror_left() {
+        // Mirrored normalized coordinates can differ in the last ulp from
+        // the ones mirrored in pixel space, so compare with a tolerance
+        let close = |a: &[([f32; 2], [f32; 2], f32)], b: &[([f32; 2], [f32; 2], f32)]| {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(a, b)| {
+                    let e = |x: f32, y: f32| (x - y).abs() < 1e-5;
+                    e(a.0[0], b.0[0])
+                        && e(a.0[1], b.0[1])
+                        && e(a.1[0], b.1[0])
+                        && e(a.1[1], b.1[1])
+                        && e(a.2, b.2)
+                })
+        };
+        for &(w, h) in &[(5.0, 7.0), (9.0, 21.0), (10.0, 20.0), (8.0, 16.0)] {
+            for &(ltr, rtl) in &[('\u{E0B0}', '\u{E0B2}'), ('\u{E0B1}', '\u{E0B3}')] {
+                let mut mirrored: Vec<([f32; 2], [f32; 2], f32)> = powerline_rects(ltr, w, h)
+                    .iter()
+                    .map(|&(pos, size, alpha)| ([1.0 - pos[0] - size[0], pos[1]], size, alpha))
+                    .collect();
+                mirrored.sort_by(|a, b| (a.0[1], a.0[0]).partial_cmp(&(b.0[1], b.0[0])).unwrap());
+                let mut right = powerline_rects(rtl, w, h);
+                right.sort_by(|a, b| (a.0[1], a.0[0]).partial_cmp(&(b.0[1], b.0[0])).unwrap());
+                assert!(
+                    close(&right, &mirrored),
+                    "{ltr:?} mirrored is {rtl:?} at {w}x{h}:\n{right:?}\n{mirrored:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn powerline_fits_only_wide_enough_cells() {
+        assert!(powerline_fits(9.0, 21.0));
+        assert!(powerline_fits(10.0, 21.0));
+        assert!(powerline_fits(8.0, 16.0));
+        assert!(!powerline_fits(8.0, 21.0), "the tip is cut off too hard");
+        assert!(
+            !powerline_fits(5.0, 21.0),
+            "the tip is cut off way too hard"
+        );
+    }
+
+    #[test]
+    fn powerline_rects_stay_in_cell() {
+        for &(w, h) in &[(9.0, 21.0), (5.79, 21.3), (10.5, 20.0), (6.0, 12.0)] {
+            for c in '\u{E0B0}'..='\u{E0B3}' {
+                for &(pos, size, alpha) in &powerline_rects(c, w, h) {
+                    assert!(size[0] > 0.0 && size[1] > 0.0, "{c:?} rect not empty");
+                    assert!(
+                        pos[0] >= 0.0 && pos[1] >= 0.0 && pos[0] + size[0] <= 1.0 + 1e-5,
+                        "{c:?} rect starts in cell"
+                    );
+                    assert!(pos[1] + size[1] <= 1.0 + 1e-5, "{c:?} rect ends in cell");
+                    assert!((0.0..=1.0).contains(&alpha), "{c:?} alpha {alpha} in range");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_glyph_rects_dispatch_and_cache() {
+        // The dispatcher routes every builtin family to its geometry
+        // unchanged, with shade alphas folded per rectangle
+        for &(c, w, h) in &[
+            ('\u{2500}', 9.0, 21.0),
+            ('\u{256E}', 9.0, 21.0),
+            ('\u{2591}', 9.0, 21.0),
+            ('\u{2588}', 9.0, 21.0),
+            ('\u{1FB00}', 9.0, 21.0),
+            ('\u{1FB3B}', 9.0, 21.0),
+            ('\u{1FB87}', 9.0, 21.0),
+            ('\u{E0B0}', 9.0, 21.0),
+            ('\u{E0B1}', 9.0, 21.0),
+            ('\u{256D}', 5.79, 21.3),
+        ] {
+            let expected: Vec<([f32; 2], [f32; 2], f32)> = if is_block_element(c) {
+                block_element_rects(c)
+                    .iter()
+                    .map(|&(pos, size)| (pos, size, block_element_alpha(c)))
+                    .collect()
+            } else if is_segment_block(c) {
+                block_element_rects(c)
+                    .iter()
+                    .map(|&(pos, size)| (pos, size, 1.0))
+                    .collect()
+            } else if is_sextant(c) {
+                sextant_rects(c)
+                    .into_iter()
+                    .map(|(pos, size)| (pos, size, 1.0))
+                    .collect()
+            } else if is_powerline(c) {
+                powerline_rects(c, w, h)
+            } else {
+                box_drawing_rects(c, w, h)
+            };
+            assert_eq!(builtin_glyph_rects(c, w, h).as_ref(), expected, "{c:?}");
+        }
+
+        // Repeats at the same metrics are served from the cache
+        let first = builtin_glyph_rects('\u{256D}', 9.0, 21.0);
+        let second = builtin_glyph_rects('\u{256D}', 9.0, 21.0);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
