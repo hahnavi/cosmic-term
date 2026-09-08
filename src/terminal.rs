@@ -230,9 +230,8 @@ pub struct BuiltinGlyph {
 /// Whether the character is drawn by the terminal itself, as rectangles at
 /// exact cell geometry, instead of a font glyph.
 ///
-/// Covers block elements and box drawing characters. The diagonal box drawing
-/// characters (U+2571..=U+2573) cannot be composed from axis-aligned
-/// rectangles and are left to the font.
+/// Covers block elements and all box drawing characters, including the
+/// diagonals, which are approximated with antialiased rectangle coverage.
 pub fn is_builtin_glyph(c: char) -> bool {
     is_block_element(c) || is_box_drawing(c)
 }
@@ -242,7 +241,7 @@ pub fn is_block_element(c: char) -> bool {
 }
 
 pub fn is_box_drawing(c: char) -> bool {
-    matches!(c, '\u{2500}'..='\u{2570}' | '\u{2574}'..='\u{257F}')
+    matches!(c, '\u{2500}'..='\u{257F}')
 }
 
 /// Rectangles covering the filled fraction of a block element cell, as
@@ -451,18 +450,25 @@ fn box_drawing_arms(c: char) -> Option<(Stroke, Stroke, Stroke, Stroke)> {
 }
 
 /// Rectangles covering the strokes of a box drawing character, as
-/// (x, y), (width, height) fractions of the cell with y measured from the top.
+/// (x, y), (width, height) fractions of the cell with y measured from the
+/// top, plus the alpha with which each rectangle is drawn.
 ///
 /// Must only be called for characters where [`is_box_drawing`] is true.
 ///
 /// Strokes run between cell edge midpoints so that borders continue
 /// seamlessly across cells, no matter which font is configured. The light
 /// stroke thickness is one eighth of the cell width, like a hand-rasterized
-/// reference implementation; heavy strokes are twice as thick.
-pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f32; 2], [f32; 2])> {
+/// reference implementation; heavy strokes are twice as thick. Diagonals run
+/// corner to corner as antialiased rectangle coverage, so that consecutive
+/// diagonal characters connect seamlessly as well.
+pub fn box_drawing_rects(
+    c: char,
+    cell_width: f32,
+    cell_height: f32,
+) -> Vec<([f32; 2], [f32; 2], f32)> {
     use Stroke::{Double, None};
 
-    let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut rects: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
 
     let stroke = (cell_width / 8.0).round().max(1.0);
     let heavy = 2.0 * stroke;
@@ -479,7 +485,7 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
                 _ => (dash_num_gaps(c), stroke),
             };
             for (x, len) in dash_segments(cell_width, num_gaps) {
-                rects.push((x, yc - thickness / 2.0, len, thickness));
+                rects.push((x, yc - thickness / 2.0, len, thickness, 1.0));
             }
         }
         '\u{2506}' | '\u{2507}' | '\u{250A}' | '\u{250B}' | '\u{254E}' | '\u{254F}' => {
@@ -488,48 +494,43 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
                 _ => (dash_num_gaps(c), stroke),
             };
             for (y, len) in dash_segments(cell_height, num_gaps) {
-                rects.push((xc - thickness / 2.0, y, thickness, len));
+                rects.push((xc - thickness / 2.0, y, thickness, len, 1.0));
             }
         }
-        // Rounded corners: '╭', '╮', '╯', '╰'. A quarter ellipse around the
-        // corner shared by the two stroked edges, connecting the horizontal
-        // and vertical edge midpoints.
-        '\u{256D}'..='\u{2570}' => {
-            // The corner point and the signs pointing from it into the cell.
-            let (cx, cy) = match c {
-                '\u{256D}' => (cell_width, cell_height), // ╭
-                '\u{256E}' => (0.0, cell_height),        // ╮
-                '\u{256F}' => (0.0, 0.0),                // ╯
-                _ => (cell_width, 0.0),                  // ╰
-            };
-            let sx = if cx == 0.0 { 1.0 } else { -1.0 };
-            let sy = if cy == 0.0 { 1.0 } else { -1.0 };
-            let point = |rx: f32, ry: f32, angle: f32| {
-                (cx + sx * rx * angle.cos(), cy + sy * ry * angle.sin())
-            };
-            let (rx, ry) = (xc, yc);
-            let (irx, iry) = (
-                (rx - stroke).max(stroke / 2.0),
-                (ry - stroke).max(stroke / 2.0),
-            );
-            let steps = (((rx + ry) / 3.0).round() as i32).clamp(4, 16) as usize;
-            let mut prev_outer = point(rx, ry, 0.0);
-            let mut prev_inner = point(irx, iry, 0.0);
-            for i in 1..=steps {
-                let angle = std::f32::consts::FRAC_PI_2 * i as f32 / steps as f32;
-                let outer = point(rx, ry, angle);
-                let inner = point(irx, iry, angle);
-                let x0 = prev_outer.0.min(prev_inner.0).min(outer.0).min(inner.0);
-                let x1 = prev_outer.0.max(prev_inner.0).max(outer.0).max(inner.0);
-                let y0 = prev_outer.1.min(prev_inner.1).min(outer.1).min(inner.1);
-                let y1 = prev_outer.1.max(prev_inner.1).max(outer.1).max(inner.1);
-                rects.push((x0, y0, x1 - x0, y1 - y0));
-                prev_outer = outer;
-                prev_inner = inner;
+        // Diagonals: '╱', '╲', '╳'. Corner-to-corner antialiased lines, so
+        // consecutive diagonals connect seamlessly at the shared corners.
+        '\u{2571}'..='\u{2573}' => {
+            // A slightly thicker band than the light stroke, so it does not
+            // look anemic next to the solid axis-aligned strokes.
+            let thickness = stroke + 0.5;
+            if c != '\u{2571}' {
+                // ╲
+                aa_line_rects(
+                    &mut rects,
+                    (0.0, 0.0),
+                    (cell_width, cell_height),
+                    thickness,
+                    cell_width,
+                    cell_height,
+                );
             }
-            // End caps, so the arc meets neighboring line characters flush.
-            rects.push((xc - stroke / 2.0, cy.min(cy + sy * stroke), stroke, stroke));
-            rects.push((cx.min(cx + sx * stroke), yc - stroke / 2.0, stroke, stroke));
+            if c != '\u{2572}' {
+                // ╱
+                aa_line_rects(
+                    &mut rects,
+                    (0.0, cell_height),
+                    (cell_width, 0.0),
+                    thickness,
+                    cell_width,
+                    cell_height,
+                );
+            }
+        }
+        // Rounded corners: '╭', '╮', '╯', '╰'. A quarter circle rasterized
+        // as a distance field with antialiased borders, so consecutive
+        // corners and strokes join seamlessly.
+        '\u{256D}'..='\u{2570}' => {
+            rects.extend(rounded_corner_pixels(c, cell_width, cell_height, stroke));
         }
         _ => {
             let Some((up, down, left, right)) = box_drawing_arms(c) else {
@@ -572,14 +573,14 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
                 };
                 if up == down {
                     for (pos, thickness) in stroke_bands(up, xc, stroke, double_gap) {
-                        rects.push((pos, 0.0, thickness, cell_height));
+                        rects.push((pos, 0.0, thickness, cell_height, 1.0));
                     }
                 } else {
                     for (pos, thickness) in stroke_bands(up, xc, stroke, double_gap) {
-                        rects.push((pos, 0.0, thickness, bottom.min(cell_height)));
+                        rects.push((pos, 0.0, thickness, bottom.min(cell_height), 1.0));
                     }
                     for (pos, thickness) in stroke_bands(down, xc, stroke, double_gap) {
-                        rects.push((pos, top, thickness, cell_height - top));
+                        rects.push((pos, top, thickness, cell_height - top, 1.0));
                     }
                 }
             }
@@ -612,14 +613,14 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
                 };
                 if left == right {
                     for (pos, thickness) in stroke_bands(left, yc, stroke, double_gap) {
-                        rects.push((0.0, pos, cell_width, thickness));
+                        rects.push((0.0, pos, cell_width, thickness, 1.0));
                     }
                 } else {
                     for (pos, thickness) in stroke_bands(left, yc, stroke, double_gap) {
-                        rects.push((0.0, pos, x1, thickness));
+                        rects.push((0.0, pos, x1, thickness, 1.0));
                     }
                     for (pos, thickness) in stroke_bands(right, yc, stroke, double_gap) {
-                        rects.push((x0, pos, cell_width - x0, thickness));
+                        rects.push((x0, pos, cell_width - x0, thickness, 1.0));
                     }
                 }
             }
@@ -628,7 +629,7 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
 
     rects
         .into_iter()
-        .map(|(x, y, width, height)| {
+        .map(|(x, y, width, height, alpha)| {
             // Clamp, so that float error on the arc slices cannot spill
             // rectangles past the cell into its neighbors.
             let x = x.clamp(0.0, cell_width);
@@ -639,9 +640,245 @@ pub fn box_drawing_rects(c: char, cell_width: f32, cell_height: f32) -> Vec<([f3
                     width.min(cell_width - x).max(0.0) / cell_width,
                     height.min(cell_height - y).max(0.0) / cell_height,
                 ],
+                alpha,
             )
         })
-        .filter(|&(_, size)| size[0] > 0.0 && size[1] > 0.0)
+        .filter(|&(_, size, _)| size[0] > 0.0 && size[1] > 0.0)
+        .collect()
+}
+
+/// Push the antialiased coverage rectangles of a line segment from
+/// (`x0`, `y0`) to (`x1`, `y1`) with the given band thickness, in pixel
+/// units, clipped to the cell.
+///
+/// Each pixel-wide step along the major axis emits up to three rectangles —
+/// the partial pixels at the band edges and the fully covered run between
+/// them — with the exact coverage as their alpha, Xiaolin Wu style. The
+/// rectangles of a step never overlap, and the pieces of neighboring cells at
+/// a shared edge compose into the coverage of the unclipped band, so the line
+/// stays seamless across cells.
+fn aa_line_rects(
+    rects: &mut Vec<(f32, f32, f32, f32, f32)>,
+    (x0, y0): (f32, f32),
+    (x1, y1): (f32, f32),
+    thickness: f32,
+    cell_width: f32,
+    cell_height: f32,
+) {
+    let steep = (y1 - y0).abs() > (x1 - x0).abs();
+    // Endpoints as (major, minor) coordinates, ordered along the major axis.
+    let (mut a, mut a_minor, mut b, mut b_minor) = if steep {
+        (y0, x0, y1, x1)
+    } else {
+        (x0, y0, x1, y1)
+    };
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut a_minor, &mut b_minor);
+    }
+    let slope = (b_minor - a_minor) / (b - a);
+    let (major_max, minor_max) = if steep {
+        (cell_height, cell_width)
+    } else {
+        (cell_width, cell_height)
+    };
+
+    for m in (a.floor() as i32)..(b.ceil() as i32) {
+        let m = m as f32;
+        if m + 1.0 <= 0.0 || m >= major_max {
+            continue;
+        }
+        // Sample the line at the center of the major-axis pixel.
+        let center = a_minor + (m + 0.5 - a) * slope;
+        let (lo, hi) = (center - thickness / 2.0, center + thickness / 2.0);
+        if hi <= 0.0 || lo >= minor_max {
+            continue;
+        }
+        let first = lo.floor();
+        let last = hi.floor();
+        // Coverage pieces along the minor axis: partial, full run, partial.
+        // Pieces fully outside the cell are skipped; the neighboring cell
+        // draws the matching piece on its side of the shared edge.
+        if first == last {
+            add_aa_piece(rects, steep, m, first, 1.0, hi - lo);
+        } else {
+            if first + 1.0 > 0.0 {
+                add_aa_piece(rects, steep, m, first, 1.0, first + 1.0 - lo);
+            }
+            let (s, e) = ((first + 1.0).max(0.0), last.min(minor_max));
+            if e > s {
+                add_aa_piece(rects, steep, m, s, e - s, 1.0);
+            }
+            if last < minor_max {
+                add_aa_piece(rects, steep, m, last, 1.0, hi - last);
+            }
+        }
+    }
+}
+
+/// Add one coverage rectangle of an antialiased line step: `span` along the
+/// minor axis starting at `i`, one pixel along the major axis at `m`.
+fn add_aa_piece(
+    rects: &mut Vec<(f32, f32, f32, f32, f32)>,
+    steep: bool,
+    m: f32,
+    i: f32,
+    span: f32,
+    alpha: f32,
+) {
+    if alpha <= 0.0 || span <= 0.0 {
+        return;
+    }
+    if steep {
+        rects.push((i, m, span, 1.0, alpha.min(1.0)));
+    } else {
+        rects.push((m, i, 1.0, span, alpha.min(1.0)));
+    }
+}
+
+/// Coverage pixels of a rounded corner: '╭', '╮', '╯' or '╰', as
+/// (x, y, width, height, alpha) rectangles in cell coordinates.
+///
+/// A quarter circle of radius `(min(width, height) + stroke) / 2` rasterized
+/// as a distance field with linear ramps on both borders, plus the straight
+/// segment connecting the arc to the cell edge it hangs from. The base arc
+/// joins the top edge at the horizontal center with the left edge at the
+/// vertical center (a '╯'); the other three corners are its mirrors. This
+/// follows the hand-rasterized reference implementation, so corners come out
+/// pixel-identical to it.
+fn rounded_corner_pixels(
+    c: char,
+    cell_width: f32,
+    cell_height: f32,
+    stroke: f32,
+) -> Vec<(f32, f32, f32, f32, f32)> {
+    let width = cell_width.max(1.0) as usize;
+    let height = cell_height.max(1.0) as usize;
+    let stroke_size = stroke.max(1.0) as usize;
+    let stroke_f = stroke_size as f32;
+
+    let radius = (width.min(height) + stroke_size) as f32 / 2.0;
+    // In a cell taller than wide the circle center slides along the left
+    // edge; otherwise it slides along the top edge.
+    let vertical = height > width;
+    let (long_side, short_side) = if vertical {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let distance_bias = if short_side % 2 == stroke_size % 2 {
+        0.0
+    } else {
+        0.5
+    };
+    let mut offset = long_side as f32 / 2.0 - radius + stroke_f / 2.0;
+    if (width % 2 != height % 2) && (long_side % 2 == stroke_size % 2) {
+        offset += 1.0;
+    }
+    let (x_offset, y_offset) = if vertical {
+        (0.0, offset)
+    } else {
+        (offset, 0.0)
+    };
+
+    let mut grid = vec![0.0f32; width * height];
+    let radius_i = (short_side + stroke_size).div_ceil(2);
+    for y in 0..radius_i {
+        for x in 0..radius_i {
+            let distance = (x as f32).hypot(y as f32) + distance_bias;
+            let value = if distance < radius - stroke_f - 1.0 {
+                // Inside the circle.
+                0.0
+            } else if distance < radius - stroke_f {
+                // On the inner border.
+                1.0 + distance - (radius - stroke_f)
+            } else if distance < radius - 1.0 {
+                // Inside the stroke.
+                1.0
+            } else if distance < radius {
+                // On the outer border.
+                radius - distance
+            } else {
+                // Outside of the circle.
+                0.0
+            };
+            if value <= 0.0 {
+                continue;
+            }
+            let px = x as f32 + x_offset;
+            let py = y as f32 + y_offset;
+            if px < 0.0 || py < 0.0 || px > width as f32 - 1.0 || py > height as f32 - 1.0 {
+                continue;
+            }
+            let index = px as usize + py as usize * width;
+            if value > grid[index] {
+                grid[index] = value;
+            }
+        }
+    }
+
+    // Straight segment from the cell edge to where the arc begins.
+    if vertical {
+        let x = width as f32 / 2.0 - stroke_f * 0.5;
+        let (start_x, end_x) = (x as usize, ((x + stroke_f) as usize).min(width));
+        let end_y = (offset as usize).min(height);
+        for y in 0..end_y {
+            for x in start_x..end_x {
+                grid[x + y * width] = 1.0;
+            }
+        }
+    } else {
+        let y = height as f32 / 2.0 - stroke_f * 0.5;
+        let (start_y, end_y) = (y as usize, ((y + stroke_f) as usize).min(height));
+        let end_x = (offset as usize).min(width);
+        for y in start_y..end_y {
+            for x in 0..end_x {
+                grid[x + y * width] = 1.0;
+            }
+        }
+    }
+
+    // Mirror the base '╯' into the other three corners.
+    if matches!(c, '\u{256D}' | '\u{2570}') {
+        let center = width / 2;
+        let extra_offset = usize::from(stroke_size % 2 != width % 2);
+        for y in 1..height {
+            let left = (y - 1) * width;
+            let right = y * width - 1;
+            if extra_offset != 0 {
+                grid[right] = grid[left];
+            }
+            for o in 0..center {
+                grid.swap(left + o, right - o - extra_offset);
+            }
+        }
+    }
+    if matches!(c, '\u{256D}' | '\u{256E}') {
+        let center = height / 2;
+        let extra_offset = usize::from(stroke_size % 2 != height % 2);
+        if extra_offset != 0 {
+            let bottom_row = (height - 1) * width;
+            for index in 0..width {
+                grid[bottom_row + index] = grid[index];
+            }
+        }
+        for o in 1..=center {
+            let top_row = (o - 1) * width;
+            let bottom_row = (height - o - extra_offset) * width;
+            for index in 0..width {
+                grid.swap(top_row + index, bottom_row + index);
+            }
+        }
+    }
+
+    grid.into_iter()
+        .enumerate()
+        .filter(|&(_, value)| value > 0.0)
+        .map(|(index, value)| {
+            let x = (index % width) as f32;
+            let y = (index / width) as f32;
+            (x, y, 1.0, 1.0, value.min(1.0))
+        })
         .collect()
 }
 
@@ -1824,28 +2061,30 @@ mod tests {
 
     #[test]
     fn builtin_glyph_coverage() {
-        // Everything but the diagonals is drawn by the terminal itself
+        // All box drawing characters, including the diagonals, and all block
+        // elements are drawn by the terminal itself
         for cp in 0x2500..=0x259F {
             let c = char::from_u32(cp).unwrap();
-            assert_eq!(is_builtin_glyph(c), !matches!(c, '\u{2571}'..='\u{2573}'));
+            assert!(is_builtin_glyph(c), "{c:?} should be a builtin glyph");
         }
         assert!(!is_builtin_glyph('a'));
-        assert!(!is_builtin_glyph('╱'));
+        assert!(!is_builtin_glyph('✓'));
     }
 
     #[test]
     fn box_drawing_rects_stay_in_cell() {
         for cp in 0x2500..=0x257F {
             let c = char::from_u32(cp).unwrap();
-            if !is_box_drawing(c) {
-                continue;
-            }
-            for &(pos, size) in &box_drawing_rects(c, 9.0, 21.0) {
+            for &(pos, size, alpha) in &box_drawing_rects(c, 9.0, 21.0) {
                 assert!(size[0] > 0.0 && size[1] > 0.0, "{c:?} rect not empty");
                 assert!(pos[0] >= 0.0 && pos[1] >= 0.0, "{c:?} rect starts in cell");
                 assert!(
                     pos[0] + size[0] <= 1.0 + 1e-5 && pos[1] + size[1] <= 1.0 + 1e-5,
                     "{c:?} rect ends in cell"
+                );
+                assert!(
+                    (0.0..=1.0).contains(&alpha),
+                    "{c:?} alpha {alpha} out of range"
                 );
             }
         }
@@ -1858,25 +2097,25 @@ mod tests {
 
         assert_eq!(
             rects('\u{2503}'),
-            vec![([3.5 / 9.0, 0.0], [2.0 / 9.0, 1.0])]
+            vec![([3.5 / 9.0, 0.0], [2.0 / 9.0, 1.0], 1.0)]
         );
         assert_eq!(
             rects('\u{2502}'),
-            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 1.0])]
+            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 1.0], 1.0)]
         );
         assert_eq!(
             rects('\u{2500}'),
-            vec![([0.0, 10.0 / 21.0], [1.0, 1.0 / 21.0])]
+            vec![([0.0, 10.0 / 21.0], [1.0, 1.0 / 21.0], 1.0)]
         );
         assert_eq!(
             rects('\u{2501}'),
-            vec![([0.0, 9.5 / 21.0], [1.0, 2.0 / 21.0])]
+            vec![([0.0, 9.5 / 21.0], [1.0, 2.0 / 21.0], 1.0)]
         );
         assert_eq!(
             rects('\u{2551}'),
             vec![
-                ([2.5 / 9.0, 0.0], [1.0 / 9.0, 1.0]),
-                ([5.5 / 9.0, 0.0], [1.0 / 9.0, 1.0]),
+                ([2.5 / 9.0, 0.0], [1.0 / 9.0, 1.0], 1.0),
+                ([5.5 / 9.0, 0.0], [1.0 / 9.0, 1.0], 1.0),
             ]
         );
 
@@ -1884,11 +2123,11 @@ mod tests {
         // bottom and the right edge, ╵ only the top half of the vertical
         let corner = rects('\u{250C}');
         assert_eq!(corner.len(), 2);
-        assert!(corner.iter().any(|&(_, size)| size == [1.0 / 9.0, 0.5]));
-        assert!(corner.iter().any(|&(_, size)| size == [0.5, 1.0 / 21.0]));
+        assert!(corner.iter().any(|&(_, size, _)| size == [1.0 / 9.0, 0.5]));
+        assert!(corner.iter().any(|&(_, size, _)| size == [0.5, 1.0 / 21.0]));
         assert_eq!(
             rects('\u{2575}'),
-            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 0.5])]
+            vec![([4.0 / 9.0, 0.0], [1.0 / 9.0, 0.5], 1.0)]
         );
     }
 
@@ -1910,7 +2149,7 @@ mod tests {
         ] {
             let centers: Vec<f32> = box_drawing_rects(c, cw, ch)
                 .iter()
-                .map(|&(pos, size)| pos[0] + size[0] / 2.0)
+                .map(|&(pos, size, _)| pos[0] + size[0] / 2.0)
                 .collect();
             let mid = centers.iter().sum::<f32>() / centers.len() as f32;
             assert!((mid - 0.5).abs() < 1e-5, "{c:?} strokes centered");
@@ -1921,7 +2160,7 @@ mod tests {
         ] {
             let centers: Vec<f32> = box_drawing_rects(c, cw, ch)
                 .iter()
-                .map(|&(pos, size)| pos[1] + size[1] / 2.0)
+                .map(|&(pos, size, _)| pos[1] + size[1] / 2.0)
                 .collect();
             let mid = centers.iter().sum::<f32>() / centers.len() as f32;
             assert!((mid - 0.5).abs() < 1e-5, "{c:?} strokes centered");
@@ -1932,7 +2171,7 @@ mod tests {
         // runs to the bottom edge, leaving the gap between the lines open.
         let stem = box_drawing_rects('\u{2564}', cw, ch)
             .into_iter()
-            .find(|&(_, size)| size[0] < 0.2)
+            .find(|&(_, size, _)| size[0] < 0.2)
             .unwrap();
         assert!(stem.0[1] > 0.5, "stem starts below the cell center");
         assert_eq!(stem.0[1] + stem.1[1], 1.0, "stem runs to the bottom edge");
@@ -1944,13 +2183,215 @@ mod tests {
         // center) with the horizontal stroke of the cell to its right (at the
         // vertical center).
         let rects = box_drawing_rects('\u{2570}', 9.0, 21.0);
-        assert!(rects.iter().any(|&(pos, size)| {
+        assert!(rects.iter().any(|&(pos, size, _)| {
             let cx = pos[0] + size[0] / 2.0;
             pos[1] == 0.0 && (cx - 0.5).abs() < 0.01 && size[1] > 0.0
         }));
-        assert!(rects.iter().any(|&(pos, size)| {
+        assert!(rects.iter().any(|&(pos, size, _)| {
             let cy = pos[1] + size[1] / 2.0;
             pos[0] + size[0] > 0.99 && (cy - 0.5).abs() < 0.01 && size[0] > 0.0
         }));
+    }
+
+    #[test]
+    fn box_drawing_arcs_match_hand_rasterized_reference() {
+        // '╯' in a 5x7 cell with a 1px stroke: a quarter circle of radius 3
+        // centered at (0, 1), drawn as a distance field with antialiased
+        // borders, plus the straight connector from the top edge to the arc.
+        let pixels: Vec<(usize, usize, f32)> = box_drawing_rects('\u{256F}', 5.0, 7.0)
+            .into_iter()
+            .map(|(pos, size, alpha)| {
+                assert!((size[0] * 5.0 - 1.0).abs() < 1e-5, "{pos:?} {size:?}");
+                assert!((size[1] * 7.0 - 1.0).abs() < 1e-5, "{pos:?} {size:?}");
+                (
+                    (pos[0] * 5.0).round() as usize,
+                    (pos[1] * 7.0).round() as usize,
+                    alpha,
+                )
+            })
+            .collect();
+        let expected = [
+            ((2, 0), 1.0), // connector from the top edge
+            ((2, 1), 1.0), // stroke peak, one stroke inside the outer radius
+            ((1, 2), 0.414_214),
+            ((2, 2), 0.763_932),
+            ((0, 3), 1.0), // meets the horizontal stroke at the vertical center
+            ((1, 3), 0.763_932),
+            ((2, 3), 0.171_573),
+        ];
+        assert_eq!(pixels.len(), expected.len());
+        for (pixel, (at, alpha)) in pixels.iter().zip(expected) {
+            assert_eq!((pixel.0, pixel.1), at, "alpha {alpha} vs {pixel:?}");
+            assert!(
+                (pixel.2 - alpha).abs() < 1e-5,
+                "alpha at {at:?}: {} vs {alpha}",
+                pixel.2
+            );
+        }
+    }
+
+    #[test]
+    fn box_drawing_arcs_are_mirrors_of_each_other() {
+        // Pixel coverage of a corner, optionally mirrored on an axis the way
+        // `rounded_corner_pixels` mirrors its base '╯': like reflecting an
+        // image, an axis whose pixel count and stroke disagree in parity
+        // duplicates the outermost column or row. Alphas are compared
+        // quantized to 1/255 steps.
+        let coverage = |c: char, w: f32, h: f32| -> Vec<(usize, usize, u32)> {
+            let mut pixels: Vec<(usize, usize, u32)> = box_drawing_rects(c, w, h)
+                .into_iter()
+                .map(|(pos, _, alpha)| {
+                    (
+                        (pos[0] * w).round() as usize,
+                        (pos[1] * h).round() as usize,
+                        (alpha * 255.0).round() as u32,
+                    )
+                })
+                .collect();
+            pixels.sort_unstable();
+            pixels
+        };
+        let mirrored = |c: char, w: f32, h: f32, fx: bool, fy: bool| -> Vec<(usize, usize, u32)> {
+            let (iw, ih) = (w as usize, h as usize);
+            let stroke = (w / 8.0).round().max(1.0) as usize;
+            let extra_x = usize::from(stroke % 2 != iw % 2);
+            let extra_y = usize::from(stroke % 2 != ih % 2);
+            let mut pixels: Vec<(usize, usize, u32)> = coverage(c, w, h)
+                .into_iter()
+                .flat_map(|(x, y, a)| {
+                    let mut mapped = vec![(x, y, a)];
+                    if fx && x == 0 && extra_x == 1 {
+                        mapped.push((iw - 1, y, a));
+                    }
+                    if fy && y == 0 && extra_y == 1 {
+                        mapped.push((x, ih - 1, a));
+                    }
+                    if fx {
+                        mapped[0].0 = iw - 1 - x - extra_x;
+                    }
+                    if fy {
+                        mapped[0].1 = ih - 1 - y - extra_y;
+                    }
+                    mapped
+                })
+                .collect();
+            pixels.sort_unstable();
+            pixels
+        };
+        let close = |a: &[(usize, usize, u32)], b: &[(usize, usize, u32)]| {
+            assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
+            for (p, q) in a.iter().zip(b) {
+                assert_eq!(p, q, "mismatched pixel");
+            }
+        };
+        // Cell sizes exercising odd/even width, height and stroke parity.
+        for (w, h) in [(9.0, 21.0), (10.0, 21.0), (21.0, 9.0), (10.0, 20.0)] {
+            // ╰ is the base '╯' mirrored on the X axis, ╮ on the Y axis, and
+            // ╭ on both.
+            close(
+                &mirrored('\u{256F}', w, h, true, false),
+                &coverage('\u{2570}', w, h),
+            );
+            close(
+                &mirrored('\u{256F}', w, h, false, true),
+                &coverage('\u{256E}', w, h),
+            );
+            close(
+                &mirrored('\u{256F}', w, h, true, true),
+                &coverage('\u{256D}', w, h),
+            );
+        }
+    }
+
+    #[test]
+    fn box_drawing_arc_stem_has_no_jog() {
+        // The curve of '╰' must leave the vertical stem without a sideways
+        // step: the stem column keeps full coverage down to where the arc
+        // starts, and nothing pokes out beside it above that point.
+        let rects = box_drawing_rects('\u{2570}', 9.0, 21.0);
+        let at = |x: usize, y: usize| {
+            rects
+                .iter()
+                .find(|&&(pos, _, _)| {
+                    (pos[0] * 9.0).round() as usize == x && (pos[1] * 21.0).round() as usize == y
+                })
+                .map(|&(_, _, alpha)| alpha)
+                .unwrap_or(0.0)
+        };
+        for y in 0..=6 {
+            assert_eq!(at(4, y), 1.0, "stem pixel (4, {y}) fully covered");
+            assert_eq!(at(3, y), 0.0, "nothing left of the stem at row {y}");
+            assert_eq!(at(5, y), 0.0, "nothing right of the stem at row {y}");
+        }
+        // From there the arc sweeps right, reaching the vertical center at
+        // the right edge, where the horizontal stroke of the next cell
+        // attaches.
+        assert_eq!(at(8, 10), 1.0);
+        assert_eq!(at(8, 9), 0.0);
+        assert_eq!(at(8, 11), 0.0);
+    }
+
+    #[test]
+    fn box_drawing_diagonals_run_corner_to_corner_without_holes() {
+        // The regression this test guards against: font-rendered diagonals do
+        // not fill the cell height, leaving holes at every line boundary and
+        // sawtoothing back to the glyph's left bearing.
+        for c in ['\u{2571}', '\u{2572}'] {
+            let rects = box_drawing_rects(c, 9.0, 21.0);
+            assert!(!rects.is_empty(), "{c:?} has rects");
+
+            // Antialiased: partial coverage pieces besides full ones.
+            assert!(rects.iter().any(|&(_, _, alpha)| alpha < 1.0));
+            assert!(
+                rects
+                    .iter()
+                    .all(|&(_, _, alpha)| (0.0..=1.0).contains(&alpha))
+            );
+
+            // The coverage reaches all four cell edges, so consecutive
+            // diagonal characters connect at the shared corners.
+            type Rect = ([f32; 2], [f32; 2], f32);
+            type EdgeTest = fn(&Rect) -> bool;
+            let touches = |edge: EdgeTest| rects.iter().any(edge);
+            assert!(touches(|&(pos, _, _)| pos[1] <= 1e-5), "{c:?} top edge");
+            assert!(
+                touches(|&(pos, size, _)| pos[1] + size[1] >= 1.0 - 1e-5),
+                "{c:?} bottom edge"
+            );
+            assert!(touches(|&(pos, _, _)| pos[0] <= 1e-5), "{c:?} left edge");
+            assert!(
+                touches(|&(pos, size, _)| pos[0] + size[0] >= 1.0 - 1e-5),
+                "{c:?} right edge"
+            );
+
+            // No holes: every pixel row of the cell carries coverage.
+            let mut rows = [false; 21];
+            for &(pos, size, alpha) in &rects {
+                if alpha > 0.0 {
+                    let first = (pos[1] * 21.0).round() as usize;
+                    let last = ((pos[1] + size[1]) * 21.0).round() as usize;
+                    rows[first..last.min(21)].fill(true);
+                }
+            }
+            assert!(rows.iter().all(|&row| row), "{c:?} covers every row");
+        }
+    }
+
+    #[test]
+    fn box_drawing_cross_has_both_diagonals() {
+        // ╳ diverges from the top-left and the top-right corner at once
+        let rects = box_drawing_rects('\u{2573}', 9.0, 21.0);
+        let starts_left = rects
+            .iter()
+            .any(|&(pos, _, _)| pos[0] <= 1e-5 && pos[1] <= 1e-5);
+        let starts_right = rects
+            .iter()
+            .any(|&(pos, size, _)| pos[0] + size[0] >= 1.0 - 1e-5 && pos[1] <= 1e-5);
+        assert!(starts_left, "╳ reaches the top left corner");
+        assert!(starts_right, "╳ reaches the top right corner");
+
+        // And it is the union of both single diagonals
+        let single = |c: char| box_drawing_rects(c, 9.0, 21.0).len();
+        assert_eq!(rects.len(), single('\u{2571}') + single('\u{2572}'));
     }
 }

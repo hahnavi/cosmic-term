@@ -39,7 +39,6 @@ use cosmic_text::LayoutGlyph;
 use indexmap::IndexSet;
 use std::{
     array,
-    borrow::Cow,
     cell::Cell,
     cmp,
     collections::HashMap,
@@ -744,23 +743,32 @@ where
             for glyph in &terminal.builtin_glyphs {
                 let x = view_position.x + glyph.column as f32 * cell_width;
                 let y = view_position.y + glyph.line as f32 * cell_height;
-                let alpha = if is_block_element(glyph.c) {
-                    block_element_alpha(glyph.c)
-                } else {
-                    1.0
-                };
                 let color = Color::from_rgba(
                     f32::from(glyph.color.r()) / 255.0,
                     f32::from(glyph.color.g()) / 255.0,
                     f32::from(glyph.color.b()) / 255.0,
-                    f32::from(glyph.color.a()) / 255.0 * alpha,
+                    f32::from(glyph.color.a()) / 255.0,
                 );
-                let rects = if is_block_element(glyph.c) {
-                    Cow::Borrowed(block_element_rects(glyph.c))
+                let rects: Vec<([f32; 2], [f32; 2], f32)> = if is_block_element(glyph.c) {
+                    block_element_rects(glyph.c)
+                        .iter()
+                        .map(|&(pos, size)| (pos, size, 1.0))
+                        .collect()
                 } else {
-                    Cow::Owned(box_drawing_rects(glyph.c, cell_width, cell_height))
+                    box_drawing_rects(glyph.c, cell_width, cell_height)
                 };
-                for &(pos, size) in rects.iter() {
+                // Shade blocks fade the whole glyph; antialiased diagonals
+                // carry their coverage per rectangle instead.
+                let glyph_alpha = if is_block_element(glyph.c) {
+                    block_element_alpha(glyph.c)
+                } else {
+                    1.0
+                };
+                for &(pos, size, alpha) in rects.iter() {
+                    let color = Color {
+                        a: color.a * glyph_alpha * alpha,
+                        ..color
+                    };
                     // Round shared edges identically so adjacent cells tile without seams
                     let left = (x + pos[0] * cell_width).round();
                     let top = (y + pos[1] * cell_height).round();
