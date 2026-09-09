@@ -28,7 +28,7 @@ use cosmic::{
 };
 use cosmic::{Apply, surface};
 use cosmic_files::dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings};
-use cosmic_text::{Family, Stretch, Weight, fontdb::FaceInfo};
+use cosmic_text::{Family, ShapeRunCache, Stretch, Weight, fontdb::FaceInfo};
 use localize::LANGUAGE_SORTER;
 use std::{
     any::TypeId,
@@ -704,6 +704,24 @@ impl App {
 
         // Update application theme
         cosmic::command::set_theme(theme)
+    }
+
+    fn update_font_name(&mut self, font_name: &str) {
+        {
+            let mut font_system = font_system().write().unwrap();
+            font_system.raw().db_mut().set_monospace_family(font_name);
+            font_system.raw().shape_run_cache = ShapeRunCache::default();
+        }
+        let panes: Vec<_> = self.pane_model.panes.iter().collect();
+        for (_pane, tab_model) in panes {
+            let entities: Vec<_> = tab_model.iter().collect();
+            for entity in entities {
+                if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                    let mut terminal = terminal.lock().unwrap();
+                    terminal.update_cell_size();
+                }
+            }
+        }
     }
 
     fn update_render_active_pane_zoom(&mut self, zoom_message: Message) -> Task<Message> {
@@ -2190,6 +2208,7 @@ impl Application for App {
             Message::Config(config) => {
                 if *config != self.config {
                     let shortcuts_changed = config.shortcuts_custom != self.config.shortcuts_custom;
+                    let font_name_changed = config.font_name != self.config.font_name;
                     log::info!("update config");
                     //TODO: update syntax theme by clearing tabs, only if needed
                     self.config = *config;
@@ -2197,6 +2216,11 @@ impl Application for App {
                         self.shortcuts_config =
                             shortcuts::ShortcutsConfig::new(self.config.shortcuts_custom.clone());
                         self.key_binds = key_binds(&self.shortcuts_config);
+                    }
+                    if font_name_changed {
+                        let font_name = self.config.font_name.clone();
+                        self.update_font_name(&font_name);
+                        self.set_curr_font_weights_and_stretches();
                     }
                     return self.update_config();
                 }
@@ -2268,23 +2292,9 @@ impl Application for App {
                 match self.font_names.get(index) {
                     Some(font_name) => {
                         if font_name != &self.config.font_name {
+                            let font_name = font_name.clone();
                             // Update font name from config
-                            {
-                                let mut font_system = font_system().write().unwrap();
-                                font_system.raw().db_mut().set_monospace_family(font_name);
-                            }
-                            let panes: Vec<_> = self.pane_model.panes.iter().collect();
-                            for (_pane, tab_model) in panes {
-                                let entities: Vec<_> = tab_model.iter().collect();
-                                for entity in entities {
-                                    if let Some(terminal) =
-                                        tab_model.data::<Mutex<Terminal>>(entity)
-                                    {
-                                        let mut terminal = terminal.lock().unwrap();
-                                        terminal.update_cell_size();
-                                    }
-                                }
-                            }
+                            self.update_font_name(&font_name);
 
                             config_set!(font_name, font_name.to_string());
                             self.set_curr_font_weights_and_stretches();
