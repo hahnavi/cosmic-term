@@ -951,7 +951,7 @@ where
                     }
                 }
                 cosmic::iced::window::Event::RedrawRequested(_) => {
-                    if is_mouse_mode {
+                    if is_mouse_mode && state.dragging.is_none() {
                         state.autoscroll.stop();
                     } else {
                         if let Some((pointer, multiplier)) = state.autoscroll.next_due()
@@ -1286,7 +1286,7 @@ where
                     let col = x / terminal.size().cell_width;
                     let row = y / terminal.size().cell_height;
 
-                    if is_mouse_mode {
+                    if is_mouse_mode && !state.modifiers.shift() {
                         state.autoscroll.stop();
                         terminal.report_mouse(
                             event.clone(),
@@ -1468,7 +1468,7 @@ where
                         shell.capture_event();
                     }
 
-                    if is_mouse_mode {
+                    if is_mouse_mode && !state.modifiers.shift() {
                         terminal.report_mouse(
                             event.clone(),
                             &state.modifiers,
@@ -1488,7 +1488,7 @@ where
                     //TODO: better calculation of position
                     let col = x / terminal.size().cell_width;
                     let row = y / terminal.size().cell_height;
-                    if is_mouse_mode {
+                    if is_mouse_mode && !state.modifiers.shift() {
                         terminal.report_mouse(
                             event.clone(),
                             &state.modifiers,
@@ -1534,7 +1534,7 @@ where
                         None
                     };
 
-                    if is_mouse_mode {
+                    if is_mouse_mode && !state.modifiers.shift() {
                         if let Some((col, row)) = col_row_opt {
                             terminal.report_mouse(
                                 event.clone(),
