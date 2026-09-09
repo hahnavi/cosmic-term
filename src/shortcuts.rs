@@ -362,6 +362,7 @@ pub fn shortcut_groups() -> Vec<ShortcutGroup> {
             KeyBindAction::ZoomReset,
         ],
     });
+    #[cfg_attr(not(feature = "password_manager"), allow(unused_mut))]
     let mut other_actions = vec![KeyBindAction::ClearScrollback];
     #[cfg(feature = "password_manager")]
     other_actions.push(KeyBindAction::PasswordManager);

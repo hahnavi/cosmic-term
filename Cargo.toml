@@ -63,15 +63,22 @@ fork = "0.4"
 xdgen = "0.1"
 
 [features]
-default = ["dbus-config", "wgpu", "wayland", "password_manager"]
+default = ["dbus-config", "wgpu", "wayland"]
 dbus-config = ["libcosmic/dbus-config"]
 wgpu = ["libcosmic/wgpu", "cosmic-files/wgpu"]
 wayland = ["libcosmic/wayland", "cosmic-files/wayland"]
 password_manager = ["secret-service", "thiserror", "secstr"]
 
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+strip = false
 
 # [patch.'https://github.com/pop-os/libcosmic']
 # libcosmic = { path = "../libcosmic" }
