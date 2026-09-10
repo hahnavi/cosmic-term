@@ -67,6 +67,8 @@ show-headerbar = Show header
 show-header-description = Reveal the header from the right-click menu
 tab-new-inherit-working-directory = New tabs and windows use current directory
 tab-new-inherit-working-directory-description = Open new tabs and windows in the active tab's working directory
+scrollback-lines = Scrollback lines
+scrollback-lines-description = Lines of output kept per terminal for scrolling back. Zero disables scrollback; higher values use more memory.
 
 ### Keyboard shortcuts
 add-another-keybinding = Add another keybinding

@@ -220,6 +220,10 @@ fn font_ligatures_default() -> bool {
     true
 }
 
+fn scrollback_lines_default() -> u32 {
+    10_000
+}
+
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     pub app_theme: AppTheme,
@@ -236,6 +240,8 @@ pub struct Config {
     pub font_size_zoom_step_mul_100: u16,
     pub opacity: u8,
     pub profiles: BTreeMap<ProfileId, Profile>,
+    #[serde(default = "scrollback_lines_default")]
+    pub scrollback_lines: u32,
     pub show_headerbar: bool,
     pub show_pane_borders: bool,
     pub use_bright_bold: bool,
@@ -267,6 +273,7 @@ impl Default for Config {
             font_weight: Weight::NORMAL.0,
             opacity: 100,
             profiles: BTreeMap::new(),
+            scrollback_lines: scrollback_lines_default(),
             show_headerbar: true,
             show_pane_borders: false,
             syntax_theme_dark: COSMIC_THEME_DARK.to_string(),

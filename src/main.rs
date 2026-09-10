@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Terminal config setup
     let term_config = term::Config {
-        scrolling_history: 100_000,
+        scrolling_history: config.scrollback_lines as usize,
         kitty_keyboard: true,
         ..term::Config::default()
     };
@@ -491,6 +491,7 @@ pub enum Message {
     ProfileSyntaxTheme(ProfileId, ColorSchemeKind, usize),
     ProfileTabTitle(ProfileId, String),
     ReorderTab(Pane, ReorderEvent),
+    ScrollbackLines(u32),
     Surface(surface::Action),
     SelectAll(Option<segmented_button::Entity>),
     ShowAdvancedFontSettings(bool),
@@ -787,6 +788,24 @@ impl App {
                 if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
                     let mut terminal = terminal.lock().unwrap();
                     terminal.update_cell_size();
+                }
+            }
+        }
+    }
+
+    fn update_scrollback(&mut self) {
+        self.term_config = term::Config {
+            scrolling_history: self.config.scrollback_lines as usize,
+            kitty_keyboard: true,
+            ..term::Config::default()
+        };
+        let panes: Vec<_> = self.pane_model.panes.iter().collect();
+        for (_pane, tab_model) in panes {
+            let entities: Vec<_> = tab_model.iter().collect();
+            for entity in entities {
+                if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                    let mut terminal = terminal.lock().unwrap();
+                    terminal.set_term_options(self.term_config.clone());
                 }
             }
         }
@@ -1618,6 +1637,18 @@ impl App {
                         self.config.tab_new_inherit_working_directory,
                         Message::TabNewInheritWorkingDirectory,
                     ),
+            )
+            .add(
+                widget::settings::item::builder(fl!("scrollback-lines"))
+                    .description(fl!("scrollback-lines-description"))
+                    .control(widget::spin_button(
+                        self.config.scrollback_lines.to_string(),
+                        self.config.scrollback_lines,
+                        1_000,
+                        0,
+                        1_000_000,
+                        Message::ScrollbackLines,
+                    )),
             );
 
         widget::settings::view_column(vec![
@@ -2259,6 +2290,8 @@ impl Application for App {
                 if *config != self.config {
                     let shortcuts_changed = config.shortcuts_custom != self.config.shortcuts_custom;
                     let font_name_changed = config.font_name != self.config.font_name;
+                    let scrollback_changed =
+                        config.scrollback_lines != self.config.scrollback_lines;
                     log::info!("update config");
                     //TODO: update syntax theme by clearing tabs, only if needed
                     self.config = *config;
@@ -2271,6 +2304,9 @@ impl Application for App {
                         let font_name = self.config.font_name.clone();
                         self.update_font_name(&font_name);
                         self.set_curr_font_weights_and_stretches();
+                    }
+                    if scrollback_changed {
+                        self.update_scrollback();
                     }
                     return self.update_config();
                 }
@@ -2852,6 +2888,12 @@ impl Application for App {
             Message::ShowPaneBorders(show_pane_borders) => {
                 if show_pane_borders != self.config.show_pane_borders {
                     config_set!(show_pane_borders, show_pane_borders);
+                }
+            }
+            Message::ScrollbackLines(scrollback_lines) => {
+                if scrollback_lines != self.config.scrollback_lines {
+                    config_set!(scrollback_lines, scrollback_lines);
+                    self.update_scrollback();
                 }
             }
             Message::UseBrightBold(use_bright_bold) => {

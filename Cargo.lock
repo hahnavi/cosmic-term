@@ -143,8 +143,7 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46319972e74179d707445f64aaa2893bbf6a111de3a9af29b7eb382f8b39e282"
+source = "git+https://github.com/hahnavi/alacritty?rev=6e3dea49920b58bb634ad01b87e8ddb91ee8613f#6e3dea49920b58bb634ad01b87e8ddb91ee8613f"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
@@ -7275,8 +7274,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+source = "git+https://github.com/hahnavi/vte?rev=4b50eb09ef4c9791aa2e439e1b52ecf983f24aae#4b50eb09ef4c9791aa2e439e1b52ecf983f24aae"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",

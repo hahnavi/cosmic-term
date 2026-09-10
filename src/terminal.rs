@@ -31,7 +31,7 @@ use std::{
     fs, io, mem,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicU32, Ordering},
     },
     time::Instant,
@@ -56,10 +56,18 @@ pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 pub const MAX_SEARCH_LINES: usize = 100;
 
 /// https://github.com/alacritty/alacritty/blob/4a7728bf7fac06a35f27f6c4f31e0d9214e5152b/alacritty/src/config/ui_config.rs#L36-L39
-fn url_regex_search() -> RegexSearch {
-    let url_regex = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
-                         [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`]+";
-    RegexSearch::new(url_regex).unwrap()
+fn url_regex_pattern() -> &'static str {
+    "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
+         [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`]+"
+}
+
+/// The URL regex and its four search DFAs are compiled and cached once and shared by every terminal; a per-terminal copy costs ~85 kB per tab.
+fn url_regex_search() -> MutexGuard<'static, RegexSearch> {
+    static URL_REGEX_SEARCH: OnceLock<Mutex<RegexSearch>> = OnceLock::new();
+    URL_REGEX_SEARCH
+        .get_or_init(|| Mutex::new(RegexSearch::new(url_regex_pattern()).unwrap()))
+        .lock()
+        .unwrap()
 }
 
 // Measures the configured font cell size and derives the default terminal size for the pre-spawned PTY.
@@ -1244,7 +1252,6 @@ pub struct Terminal {
     pub profile_id_opt: Option<ProfileId>,
     pub tab_title_override: Option<String>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
-    pub url_regex_search: RegexSearch,
     pub regex_matches: Vec<alacritty_terminal::term::search::Match>,
     pub active_regex_match: Option<alacritty_terminal::term::search::Match>,
     pub active_hyperlink_id: Option<String>,
@@ -1358,7 +1365,6 @@ impl Terminal {
         Ok(Self {
             active_regex_match: None,
             active_hyperlink_id: None,
-            url_regex_search: url_regex_search(),
             regex_matches: Vec::new(),
             builtin_glyphs: Vec::new(),
             bold_font_weight: Weight(bold_font_weight),
@@ -1430,6 +1436,11 @@ impl Terminal {
 
     pub fn set_zoom_adj(&mut self, value: i8) {
         self.zoom_adj = value;
+    }
+
+    pub fn set_term_options(&mut self, options: Config) {
+        self.term.lock().set_options(options);
+        self.needs_update = true;
     }
 
     fn set_focused(&mut self, is_focused: bool) {
@@ -1820,6 +1831,7 @@ impl Terminal {
             let mut line_i = 0;
             let mut last_point = None;
             let mut text = String::from(LRI);
+            let mut last_visible = text.len();
             let mut attrs_list = AttrsList::new(&self.default_attrs);
             {
                 let mut term = self.term.lock();
@@ -1832,11 +1844,12 @@ impl Terminal {
 
                 self.regex_matches.clear();
                 {
+                    let mut url_regex_search = url_regex_search();
                     let mut regex_matches: Vec<_> =
-                        visible_regex_match_iter(&term, &mut self.url_regex_search).collect();
+                        visible_regex_match_iter(&term, &mut url_regex_search).collect();
                     self.regex_matches
                         .extend(regex_matches.drain(..).flat_map(|rm| -> Vec<_> {
-                            HintPostProcessor::new(&term, &mut self.url_regex_search, rm).collect()
+                            HintPostProcessor::new(&term, &mut url_regex_search, rm).collect()
                         }));
                 }
 
@@ -1853,8 +1866,9 @@ impl Terminal {
                             buffer.set_redraw(true);
                         }
 
+                        text.truncate(last_visible);
                         if buffer.lines[line_i].set_text(
-                            text.clone(),
+                            &text,
                             LineEnding::default(),
                             attrs_list.clone(),
                         ) {
@@ -1864,6 +1878,7 @@ impl Terminal {
 
                         text.clear();
                         text.push(LRI);
+                        last_visible = text.len();
                         attrs_list.clear_spans();
                     }
                     //TODO: use indexed.point.column?
@@ -2024,8 +2039,15 @@ impl Terminal {
                         //TODO: automatically use fake italic
                         attrs = attrs.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
                     }
-                    if attrs != attrs_list.defaults() {
+                    let is_default_attrs = attrs == attrs_list.defaults();
+                    if !is_default_attrs {
                         attrs_list.add_span(start..end, &attrs);
+                    }
+
+                    let is_blank_cell = (indexed.cell.c == ' ' || indexed.cell.c == '\t')
+                        && indexed.cell.zerowidth().is_none();
+                    if !is_default_attrs || !is_blank_cell {
+                        last_visible = end;
                     }
 
                     last_point = Some(indexed.point);
@@ -2043,6 +2065,7 @@ impl Terminal {
                 buffer.set_redraw(true);
             }
 
+            text.truncate(last_visible);
             if buffer.lines[line_i].set_text(text, LineEnding::default(), attrs_list) {
                 buffer.set_redraw(true);
             }
@@ -2057,7 +2080,7 @@ impl Terminal {
             {
                 let mut font_system = font_system().write().unwrap();
                 buffer.shape_until_scroll(font_system.raw(), true);
-                font_system.raw().shape_run_cache.trim(1024);
+                font_system.raw().shape_run_cache.trim(1);
             }
         }
 
