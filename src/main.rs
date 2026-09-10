@@ -188,6 +188,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Terminal config setup
     let term_config = term::Config {
         scrolling_history: 100_000,
+        kitty_keyboard: true,
         ..term::Config::default()
     };
     // Set up environmental variables for terminal

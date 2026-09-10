@@ -997,6 +997,41 @@ where
                     }
                 }
 
+                // Kitty keyboard protocol sends modified control keys as CSI u sequences
+                let kitty_code = match named {
+                    Named::Enter => Some(13),
+                    Named::Tab => Some(9),
+                    Named::Backspace => Some(127),
+                    Named::Escape => Some(27),
+                    _ => None,
+                };
+                if let Some(kitty_code) = kitty_code {
+                    let term_mode = *terminal.term.lock().mode();
+                    if term_mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
+                        || (term_mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
+                            && (!modifiers.is_empty() || matches!(named, Named::Escape)))
+                    {
+                        //Escape with any modifier will cancel selection
+                        if *named == Named::Escape {
+                            let had_selection = {
+                                let mut term = terminal.term.lock();
+                                term.selection.take().is_some()
+                            };
+                            if had_selection {
+                                terminal.update();
+                                shell.capture_event();
+
+                                return;
+                            }
+                        }
+                        let mod_no = calculate_modifier_number(state);
+                        terminal.input_scroll(csi_u(kitty_code, mod_no));
+                        shell.capture_event();
+
+                        return;
+                    }
+                }
+
                 let mod_no = calculate_modifier_number(state);
                 let escape_code = match named {
                     Named::Insert => csi("2", "~", mod_no),
@@ -2087,9 +2122,31 @@ fn ss3(code: &str, modifiers: u8) -> Option<Vec<u8>> {
     }
 }
 
+// Kitty CSI u encoding: modifier parameter omitted when no modifier is pressed.
+#[inline(always)]
+fn csi_u(code: u8, modifiers: u8) -> Vec<u8> {
+    if modifiers == 1 {
+        format!("\x1B[{code}u").into_bytes()
+    } else {
+        format!("\x1B[{code};{modifiers}u").into_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EdgeScrollDirection, accumulate_wheel_lines, edge_scroll_adjustment};
+    use super::{EdgeScrollDirection, accumulate_wheel_lines, csi_u, edge_scroll_adjustment};
+
+    #[test]
+    fn csi_u_encodes_kitty_control_codes() {
+        // No modifiers: the parameter is omitted.
+        assert_eq!(csi_u(13, 1), b"\x1b[13u");
+        // Shift, Alt and Ctrl map to 2, 3 and 5.
+        assert_eq!(csi_u(13, 2), b"\x1b[13;2u");
+        assert_eq!(csi_u(13, 3), b"\x1b[13;3u");
+        assert_eq!(csi_u(13, 5), b"\x1b[13;5u");
+        assert_eq!(csi_u(9, 2), b"\x1b[9;2u");
+        assert_eq!(csi_u(127, 7), b"\x1b[127;7u");
+    }
 
     #[test]
     fn wheel_lines_single_fractional_event_keeps_remainder() {
