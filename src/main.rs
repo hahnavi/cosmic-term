@@ -197,6 +197,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         env::set_var("TERM", "xterm-256color");
     }
 
+    // Pre-spawn the PTY for the first terminal so the shell initializes while the app launches.
+    let startup_pty = {
+        let profile = config
+            .default_profile
+            .and_then(|profile_id| config.profiles.get(&profile_id));
+        let (options, _) = resolve_terminal_options(
+            startup_options.clone().unwrap_or_default(),
+            profile,
+            None,
+        );
+        let size = terminal::startup_terminal_size(&config);
+        match tty::new(&options, size.into(), 0) {
+            Ok(pty) => Some(StartupPty { pty, options, size }),
+            Err(err) => {
+                log::error!("failed to pre-spawn terminal: {}", err);
+                None
+            }
+        }
+    };
+
     // Set settings
     let mut settings = Settings::default();
     settings = settings.theme(config.app_theme.theme());
@@ -208,6 +228,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         config,
         shortcuts_config,
         startup_options,
+        startup_pty,
         term_config,
     };
 
@@ -230,13 +251,57 @@ Options:
     );
 }
 
-#[derive(Clone, Debug)]
 pub struct Flags {
     config_handler: Option<cosmic_config::Config>,
     config: Config,
     shortcuts_config: shortcuts::ShortcutsConfig,
     startup_options: Option<tty::Options>,
+    startup_pty: Option<StartupPty>,
     term_config: term::Config,
+}
+
+struct StartupPty {
+    pty: tty::Pty,
+    options: tty::Options,
+    size: terminal::Size,
+}
+
+// Merge startup options with an optional profile into the options for a new terminal.
+fn resolve_terminal_options(
+    startup_options: tty::Options,
+    profile: Option<&Profile>,
+    inherited_working_directory: Option<&PathBuf>,
+) -> (tty::Options, Option<String>) {
+    let Some(profile) = profile else {
+        let mut options = startup_options;
+        if options.working_directory.is_none() {
+            options.working_directory = inherited_working_directory.cloned();
+        }
+        return (options, None);
+    };
+
+    let options = tty::Options {
+        shell: startup_options.shell.or_else(|| {
+            if let Some(mut args) = shlex::split(&profile.command)
+                && !args.is_empty()
+            {
+                let command = args.remove(0);
+                return Some(tty::Shell::new(command, args));
+            }
+            None
+        }),
+        working_directory: startup_options
+            .working_directory
+            .or_else(|| inherited_working_directory.cloned())
+            .or_else(|| {
+                (!profile.working_directory.is_empty())
+                    .then(|| profile.working_directory.clone().into())
+            }),
+        drain_on_exit: startup_options.drain_on_exit || profile.drain_on_exit,
+        ..startup_options
+    };
+    let tab_title_override = (!profile.tab_title.is_empty()).then(|| profile.tab_title.clone());
+    (options, tab_title_override)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -510,6 +575,7 @@ pub struct App {
     term_event_tx_opt:
         Option<mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, TermEvent)>>,
     startup_options: Option<tty::Options>,
+    startup_pty: Option<StartupPty>,
     term_config: term::Config,
     color_scheme_errors: Vec<String>,
     color_scheme_expanded: Option<(ColorSchemeKind, Option<ColorSchemeId>)>,
@@ -1597,47 +1663,23 @@ impl App {
                     Some(colors) => {
                         let current_pane = self.pane_model.focused();
                         if let Some(tab_model) = self.pane_model.active_mut() {
-                            let (options, tab_title_override) = if let Some(profile) =
-                                profile_id_opt
-                                    .and_then(|profile_id| self.config.profiles.get(&profile_id))
-                            {
+                            let (options, tab_title_override) = {
+                                let profile = profile_id_opt
+                                    .and_then(|profile_id| self.config.profiles.get(&profile_id));
                                 // Merge profile and startup options, preferring startup options
                                 let startup_options =
                                     self.startup_options.take().unwrap_or_default();
-                                let options = tty::Options {
-                                    shell: startup_options.shell.or_else(|| {
-                                        if let Some(mut args) = shlex::split(&profile.command)
-                                            && !args.is_empty()
-                                        {
-                                            let command = args.remove(0);
-                                            return Some(tty::Shell::new(command, args));
-                                        }
-                                        None
-                                    }),
-                                    working_directory: startup_options
-                                        .working_directory
-                                        .or_else(|| inherited_working_directory.clone())
-                                        .or_else(|| {
-                                            (!profile.working_directory.is_empty())
-                                                .then(|| profile.working_directory.clone().into())
-                                        }),
-                                    drain_on_exit: startup_options.drain_on_exit
-                                        || profile.drain_on_exit,
-                                    ..startup_options
-                                };
-                                let tab_title_override = if profile.tab_title.is_empty() {
-                                    None
-                                } else {
-                                    Some(profile.tab_title.clone())
-                                };
-                                (options, tab_title_override)
-                            } else {
-                                let mut options = self.startup_options.take().unwrap_or_default();
-                                if options.working_directory.is_none() {
-                                    options.working_directory = inherited_working_directory.clone();
-                                }
-                                (options, None)
+                                resolve_terminal_options(
+                                    startup_options,
+                                    profile,
+                                    inherited_working_directory.as_ref(),
+                                )
                             };
+
+                            let startup_pty = self
+                                .startup_pty
+                                .take()
+                                .filter(|startup_pty| startup_pty.options == options);
 
                             let entity = tab_model
                                 .insert()
@@ -1655,6 +1697,7 @@ impl App {
                                 term_event_tx.clone(),
                                 self.term_config.clone(),
                                 options,
+                                startup_pty.map(|startup_pty| (startup_pty.pty, startup_pty.size)),
                                 &self.config,
                                 *colors,
                                 profile_id_opt,
@@ -1904,6 +1947,7 @@ impl Application for App {
             find_search_id: widget::Id::unique(),
             find_search_value: String::new(),
             startup_options: flags.startup_options,
+            startup_pty: flags.startup_pty,
             term_config: flags.term_config,
             term_event_tx_opt: None,
             color_scheme_errors: Vec::new(),

@@ -21,7 +21,8 @@ use cosmic::{
     widget::{pane_grid, segmented_button},
 };
 use cosmic_text::{
-    Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, LineEnding, Shaping, Weight, Wrap,
+    Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, LineEnding, ShapeRunCache,
+    Shaping, Weight, Wrap,
 };
 use indexmap::IndexSet;
 use std::{
@@ -59,6 +60,44 @@ fn url_regex_search() -> RegexSearch {
     let url_regex = "(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)\
                          [^\u{0000}-\u{001F}\u{007F}-\u{009F}<>\"\\s{-}\\^⟨⟩`]+";
     RegexSearch::new(url_regex).unwrap()
+}
+
+// Measures the configured font cell size and derives the default terminal size for the pre-spawned PTY.
+pub fn startup_terminal_size(app_config: &AppConfig) -> Size {
+    let font_stretch = app_config.typed_font_stretch();
+    let font_weight = app_config.font_weight;
+    let metrics = app_config.metrics(0);
+
+    let attrs = Attrs::new()
+        .family(Family::Monospace)
+        .weight(Weight(font_weight))
+        .stretch(font_stretch);
+
+    let mut buffer = Buffer::new_empty(metrics);
+    let cell_width = {
+        let mut font_system = font_system().write().unwrap();
+        font_system
+            .raw()
+            .db_mut()
+            .set_monospace_family(&app_config.font_name);
+        let font_system = font_system.raw();
+        buffer.set_wrap(Wrap::None);
+
+        // Use size of space to determine cell size
+        buffer.set_text(" ", &attrs, Shaping::Advanced, None);
+        let layout = buffer.line_layout(font_system, 0).unwrap();
+        let cell_width = layout[0].w;
+
+        font_system.shape_run_cache = ShapeRunCache::default();
+        cell_width
+    };
+
+    Size {
+        width: (80.0 * cell_width).ceil() as u32,
+        height: (24.0 * metrics.line_height).ceil() as u32,
+        cell_width,
+        cell_height: metrics.line_height,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1221,6 +1260,7 @@ impl Terminal {
         event_tx: mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, Event)>,
         config: Config,
         options: Options,
+        startup_pty: Option<(tty::Pty, Size)>,
         app_config: &AppConfig,
         colors: Colors,
         profile_id_opt: Option<ProfileId>,
@@ -1278,7 +1318,17 @@ impl Terminal {
         )));
 
         let window_id = 0;
-        let pty = tty::new(&options, size.into(), window_id)?;
+        let pty = match startup_pty {
+            Some((mut pty, startup_size)) => {
+                if startup_size.cell_width != size.cell_width
+                    || startup_size.cell_height != size.cell_height
+                {
+                    pty.on_resize(size.into());
+                }
+                pty
+            }
+            None => tty::new(&options, size.into(), window_id)?,
+        };
         #[cfg(not(windows))]
         let shell_pid = Some(pty.child().id());
         #[cfg(windows)]
