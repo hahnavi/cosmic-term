@@ -514,6 +514,7 @@ pub enum Message {
     ToggleContextPage(ContextPage),
     UpdateDefaultProfile((bool, ProfileId)),
     UseBrightBold(bool),
+    UseFontLigatures(bool),
     WindowClose,
     WindowNew,
     WindowFocused,
@@ -1574,6 +1575,10 @@ impl App {
                 .add(
                     widget::settings::item::builder(fl!("use-bright-bold"))
                         .toggler(self.config.use_bright_bold, Message::UseBrightBold),
+                )
+                .add(
+                    widget::settings::item::builder(fl!("font-ligatures"))
+                        .toggler(self.config.font_ligatures, Message::UseFontLigatures),
                 );
             let padding = Padding {
                 top: 0.0,
@@ -2852,6 +2857,12 @@ impl Application for App {
             Message::UseBrightBold(use_bright_bold) => {
                 if use_bright_bold != self.config.use_bright_bold {
                     config_set!(use_bright_bold, use_bright_bold);
+                    return self.update_config();
+                }
+            }
+            Message::UseFontLigatures(font_ligatures) => {
+                if font_ligatures != self.config.font_ligatures {
+                    config_set!(font_ligatures, font_ligatures);
                     return self.update_config();
                 }
             }

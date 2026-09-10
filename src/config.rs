@@ -216,6 +216,10 @@ impl Default for Profile {
     }
 }
 
+fn font_ligatures_default() -> bool {
+    true
+}
+
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     pub app_theme: AppTheme,
@@ -227,6 +231,8 @@ pub struct Config {
     pub dim_font_weight: u16,
     pub bold_font_weight: u16,
     pub font_stretch: u16,
+    #[serde(default = "font_ligatures_default")]
+    pub font_ligatures: bool,
     pub font_size_zoom_step_mul_100: u16,
     pub opacity: u8,
     pub profiles: BTreeMap<ProfileId, Profile>,
@@ -255,6 +261,7 @@ impl Default for Config {
             tab_new_inherit_working_directory: false,
             font_name: "Noto Sans Mono".to_string(),
             font_size: 14,
+            font_ligatures: font_ligatures_default(),
             font_size_zoom_step_mul_100: 100,
             font_stretch: Stretch::Normal.to_number(),
             font_weight: Weight::NORMAL.0,

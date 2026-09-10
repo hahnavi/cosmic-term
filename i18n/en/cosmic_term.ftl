@@ -54,6 +54,7 @@ default-font-weight = Normal font weight
 default-dim-font-weight = Dim font weight
 default-bold-font-weight = Bold font weight
 use-bright-bold = Make bold text brighter
+font-ligatures = Font ligatures
 
 ### Splits
 splits = Splits

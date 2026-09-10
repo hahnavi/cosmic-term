@@ -21,8 +21,8 @@ use cosmic::{
     widget::{pane_grid, segmented_button},
 };
 use cosmic_text::{
-    Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, LineEnding, ShapeRunCache,
-    Shaping, Weight, Wrap,
+    Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, FeatureTag, FontFeatures,
+    LineEnding, ShapeRunCache, Shaping, Weight, Wrap,
 };
 use indexmap::IndexSet;
 use std::{
@@ -1223,6 +1223,19 @@ impl Metadata {
     }
 }
 
+/// OpenType features for default attrs, disabling ligatures while preserving RTL and fallback shaping.
+fn font_features_for(ligatures: bool) -> FontFeatures {
+    let mut features = FontFeatures::new();
+    if !ligatures {
+        features
+            .disable(FeatureTag::STANDARD_LIGATURES)
+            .disable(FeatureTag::CONTEXTUAL_LIGATURES)
+            .disable(FeatureTag::CONTEXTUAL_ALTERNATES)
+            .disable(FeatureTag::DISCRETIONARY_LIGATURES);
+    }
+    features
+}
+
 pub struct Terminal {
     pub context_menu: Option<MenuState>,
     pub metadata_set: IndexSet<Metadata>,
@@ -1247,6 +1260,7 @@ pub struct Terminal {
     search_value: String,
     shell_pid: Option<u32>,
     size: Size,
+    font_ligatures: bool,
     use_bright_bold: bool,
     zoom_adj: i8,
 }
@@ -1271,6 +1285,7 @@ impl Terminal {
         let dim_font_weight = app_config.dim_font_weight;
         let bold_font_weight = app_config.bold_font_weight;
         let use_bright_bold = app_config.use_bright_bold;
+        let font_ligatures = app_config.font_ligatures;
 
         let metrics = app_config.metrics(0);
 
@@ -1286,6 +1301,7 @@ impl Terminal {
             .family(Family::Monospace)
             .weight(Weight(font_weight))
             .stretch(font_stretch)
+            .font_features(font_features_for(font_ligatures))
             .color(default_fg)
             .metadata(default_metada_idx);
 
@@ -1362,6 +1378,7 @@ impl Terminal {
             size,
             tab_title_override,
             term,
+            font_ligatures,
             use_bright_bold,
             zoom_adj: Default::default(),
             is_focused: true,
@@ -1674,6 +1691,15 @@ impl Terminal {
             update_cell_size = true;
         }
 
+        if self.font_ligatures != config.font_ligatures {
+            self.font_ligatures = config.font_ligatures;
+            self.default_attrs = self
+                .default_attrs
+                .clone()
+                .font_features(font_features_for(config.font_ligatures));
+            update = true;
+        }
+
         if self.use_bright_bold != config.use_bright_bold {
             self.use_bright_bold = config.use_bright_bold;
             update_cell_size = true;
@@ -1728,6 +1754,7 @@ impl Terminal {
                 .family(Family::Monospace)
                 .weight(Weight(config.font_weight))
                 .stretch(config.typed_font_stretch())
+                .font_features(font_features_for(self.font_ligatures))
                 .color(default_fg)
                 .metadata(default_metadata_idx);
         }
