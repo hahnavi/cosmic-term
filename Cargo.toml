@@ -46,8 +46,7 @@ features = ["monospace_fallback", "shape-run-cache"]
 
 [dependencies.libcosmic]
 git = "https://github.com/hahnavi/libcosmic.git"
-# pinned to the fork tip (includes the pop-os master merge)
-rev = "af396d7b07e764bdf4fee7936533a12929c3d8e1"
+rev = "12819afdb7c44ff212813b0be1add850bf37950e"
 default-features = false
 #TODO: a11y feature crashes file chooser dialog
 features = [
@@ -96,7 +95,7 @@ strip = false
 # iced_winit = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 
 [patch."https://github.com/pop-os/libcosmic.git"]
-libcosmic = { git = "https://github.com/hahnavi/libcosmic.git", rev = "af396d7b07e764bdf4fee7936533a12929c3d8e1" }
+libcosmic = { git = "https://github.com/hahnavi/libcosmic.git", rev = "12819afdb7c44ff212813b0be1add850bf37950e" }
 
 [patch.crates-io]
 alacritty_terminal = { git = "https://github.com/hahnavi/alacritty", rev = "6e3dea49920b58bb634ad01b87e8ddb91ee8613f" }

@@ -20,8 +20,7 @@ use std::{collections::HashMap, sync::LazyLock};
 
 use crate::{Action, ColorSchemeId, ColorSchemeKind, Config, Message, fl};
 
-static MENU_ID: LazyLock<cosmic::widget::Id> =
-    LazyLock::new(|| cosmic::widget::Id::new("responsive-menu"));
+static MENU_ID: LazyLock<cosmic::widget::Id> = LazyLock::new(cosmic::widget::Id::unique);
 
 #[derive(Debug, Clone)]
 pub struct MenuState {
@@ -195,11 +194,51 @@ pub fn color_scheme_menu<'a>(
         .into()
 }
 
-pub fn menu_bar<'a>(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MenuBarKey {
+    key_binds_revision: u64,
+    profile_fingerprint: u64,
+    dark: bool,
+    menu_bar: Option<[u32; 6]>,
+}
+
+#[must_use]
+pub fn menu_bar_key(core: &Core, config: &Config, key_binds_revision: u64) -> MenuBarKey {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.profiles.len().hash(&mut hasher);
+    for (profile_id, profile) in &config.profiles {
+        profile_id.0.hash(&mut hasher);
+        profile.name.hash(&mut hasher);
+    }
+
+    let menu_bar = core.menu_bar_size(&MENU_ID).map(|(limits, size)| {
+        let min = limits.min();
+        let max = limits.max();
+        [
+            min.width.to_bits(),
+            min.height.to_bits(),
+            max.width.to_bits(),
+            max.height.to_bits(),
+            size.width.to_bits(),
+            size.height.to_bits(),
+        ]
+    });
+
+    MenuBarKey {
+        key_binds_revision,
+        profile_fingerprint: hasher.finish(),
+        dark: config.color_scheme_kind(core.system_theme()) == ColorSchemeKind::Dark,
+        menu_bar,
+    }
+}
+
+pub fn menu_bar(
     core: &Core,
     config: &Config,
     key_binds: &HashMap<KeyBind, Action>,
-) -> Element<'a, Message> {
+) -> Element<'static, Message> {
     let mut profile_items = Vec::with_capacity(config.profiles.len());
     for (name, id) in config.profile_names() {
         profile_items.push(MenuItem::Button(name, None, Action::ProfileOpen(id)));

@@ -553,6 +553,7 @@ pub struct App {
     config: Config,
     shortcuts_config: shortcuts::ShortcutsConfig,
     key_binds: HashMap<KeyBind, Action>,
+    menu_revision: u64,
     app_themes: Vec<String>,
     font_names: Vec<String>,
     font_size_names: Vec<String>,
@@ -698,6 +699,7 @@ impl App {
             }
         }
         self.key_binds = key_binds(&self.shortcuts_config);
+        self.menu_revision = self.menu_revision.wrapping_add(1);
     }
 
     fn apply_shortcut_binding(
@@ -1961,6 +1963,7 @@ impl Application for App {
             config: flags.config,
             shortcuts_config: flags.shortcuts_config,
             key_binds,
+            menu_revision: 0,
             app_themes,
             font_names,
             font_size_names,
@@ -2295,6 +2298,7 @@ impl Application for App {
                     log::info!("update config");
                     //TODO: update syntax theme by clearing tabs, only if needed
                     self.config = *config;
+                    self.menu_revision = self.menu_revision.wrapping_add(1);
                     if shortcuts_changed {
                         self.shortcuts_config =
                             shortcuts::ShortcutsConfig::new(self.config.shortcuts_custom.clone());
@@ -3506,7 +3510,11 @@ impl Application for App {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![menu_bar(&self.core, &self.config, &self.key_binds)]
+        let key = menu::menu_bar_key(&self.core, &self.config, self.menu_revision);
+        let view = move |_key: &menu::MenuBarKey| -> Element<'static, Message> {
+            menu_bar(&self.core, &self.config, &self.key_binds)
+        };
+        vec![widget::lazy(key, view).into()]
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
