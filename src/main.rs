@@ -524,6 +524,7 @@ pub enum Message {
     ZoomOut,
     ZoomReset,
     ContextMenuPopupClosed(window::Id),
+    ContextMenuPopupUnfocused(window::Id),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2549,7 +2550,10 @@ impl Application for App {
                         return self.update(Message::Paste(None));
                     }
                     Key::Named(Named::Escape) => {
-                        // Handled by on_escape
+                        // Close the context menu popup before on_escape handles Escape.
+                        if let Some((_popup_id, pane, _, _, _, _)) = self.context_menu_popup {
+                            return self.update(Message::TabContextMenu(pane, None));
+                        }
                         return Task::none();
                     }
                     _ => {}
@@ -3419,6 +3423,16 @@ impl Application for App {
                     self.context_menu_popup = None;
                 }
             }
+            Message::ContextMenuPopupUnfocused(id) => {
+                if let Some((popup_id, pane, _, _, _, _)) = self.context_menu_popup
+                    && id == popup_id
+                {
+                    // The compositor released the popup's keyboard grab without
+                    // dismissing the popup, which happens when Escape is pressed
+                    // while the popup is open.
+                    return self.update(Message::TabContextMenu(pane, None));
+                }
+            }
             Message::Surface(a) => {
                 return cosmic::task::message(cosmic::Action::Surface(a));
             }
@@ -3786,7 +3800,7 @@ impl Application for App {
         struct TerminalEventSubscription;
 
         Subscription::batch([
-            event::listen_with(|event, _status, _window_id| match event {
+            event::listen_with(|event, _status, window_id| match event {
                 Event::Keyboard(KeyEvent::KeyPressed {
                     key,
                     physical_key,
@@ -3799,6 +3813,24 @@ impl Application for App {
                 Event::Mouse(MouseEvent::ButtonReleased(MouseButton::Left)) => {
                     Some(Message::CopyPrimary(None))
                 }
+                // The compositor dismissed the popup or released its keyboard
+                // grab, e.g. when Escape is pressed while the popup is open.
+                #[cfg(feature = "wayland")]
+                Event::PlatformSpecific(cosmic::iced::event::PlatformSpecific::Wayland(
+                    cosmic::iced::event::wayland::Event::Popup(
+                        cosmic::iced::event::wayland::PopupEvent::Done,
+                        _,
+                        _,
+                    ),
+                )) => Some(Message::ContextMenuPopupClosed(window_id)),
+                #[cfg(feature = "wayland")]
+                Event::PlatformSpecific(cosmic::iced::event::PlatformSpecific::Wayland(
+                    cosmic::iced::event::wayland::Event::Popup(
+                        cosmic::iced::event::wayland::PopupEvent::Unfocused,
+                        _,
+                        _,
+                    ),
+                )) => Some(Message::ContextMenuPopupUnfocused(window_id)),
                 _ => None,
             }),
             Subscription::run_with(TypeId::of::<TerminalEventSubscription>(), |_| {
