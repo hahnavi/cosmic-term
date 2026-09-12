@@ -492,7 +492,7 @@ pub enum Message {
     ProfileTabTitle(ProfileId, String),
     ReorderTab(Pane, ReorderEvent),
     ScrollbackLines(u32),
-    Surface(surface::Action),
+    Surface(surface::Action<Message>),
     SelectAll(Option<segmented_button::Entity>),
     ShowAdvancedFontSettings(bool),
     ShowHeaderBar(bool),
@@ -3416,9 +3416,7 @@ impl Application for App {
                 }
             }
             Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(a),
-                ));
+                return cosmic::task::message(cosmic::Action::Surface(a));
             }
             Message::ReorderTab(
                 pane,
