@@ -266,8 +266,16 @@ where
         let width = terminal.size().cell_width;
         let mut cursor_position = Vector::<f32>::ZERO;
         let mut line_height = 0.0;
+        let buffer_start_line = terminal.buffer_start_line();
+        let buffer_line = (line - buffer_start_line).max(0) as usize;
         terminal.with_buffer(|buffer| {
-            let layout = buffer.layout_runs().nth(line as usize).unwrap();
+            let layout_opt = buffer
+                .layout_runs()
+                .nth(buffer_line)
+                .or_else(|| buffer.layout_runs().last());
+            let Some(layout) = layout_opt else {
+                return;
+            };
             for glyph in layout.glyphs {
                 cursor_position.x += glyph.w;
                 let ch_width = if glyph.w > width { 2 } else { 1 };
@@ -485,6 +493,9 @@ where
             terminal.needs_update = false;
         }
 
+        // Position the rendered buffer window at the smooth scroll offset.
+        terminal.set_scroll_position(state.scroll_current);
+
         // Render default background
         {
             let meta = &terminal.metadata_set[terminal.default_attrs().metadata];
@@ -510,6 +521,10 @@ where
                 ),
             );
         }
+
+        // Clip the extra row rendered above the viewport during smooth scrolling.
+        let content_bounds = Rectangle::new(view_position, Size::new(view_w as f32, view_h as f32));
+        renderer.start_layer(content_bounds);
 
         // Render cell backgrounds that do not match default
         terminal.with_buffer(|buffer| {
@@ -738,9 +753,11 @@ where
         {
             let cell_width = terminal.size().cell_width;
             let cell_height = terminal.size().cell_height;
+            let scroll = terminal.with_buffer(|buffer| buffer.scroll());
+            let scroll_offset = scroll.line as f32 * cell_height + scroll.vertical;
             for glyph in &terminal.builtin_glyphs {
                 let x = view_position.x + glyph.column as f32 * cell_width;
-                let y = view_position.y + glyph.line as f32 * cell_height;
+                let y = view_position.y + glyph.line as f32 * cell_height - scroll_offset;
                 let color = Color::from_rgba(
                     f32::from(glyph.color.r()) / 255.0,
                     f32::from(glyph.color.g()) / 255.0,
@@ -865,8 +882,12 @@ where
                     .unwrap_or(Color::WHITE); // TODO default color from theme?
                 let width = terminal.size().cell_width;
                 let height = terminal.size().cell_height;
+                let scroll = terminal.with_buffer(|buffer| buffer.scroll());
+                let scroll_offset = scroll.line as f32 * height + scroll.vertical;
+                let buffer_line = line - terminal.buffer_start_line();
+                let cursor_top = buffer_line as f32 * height - scroll_offset;
                 let top_left = view_position
-                    + Vector::new((col as f32 * width).floor(), (line as f32 * height).floor());
+                    + Vector::new((col as f32 * width).floor(), cursor_top.floor());
                 match cursor.shape {
                     CursorShape::Beam => {
                         let quad = Quad {
@@ -881,7 +902,7 @@ where
                                 view_position
                                     + Vector::new(
                                         (col as f32 * width).floor(),
-                                        ((line + 1) as f32 * height).floor(),
+                                        (cursor_top + height).floor(),
                                     ),
                                 Size::new(width, 1.0),
                             ),
@@ -918,6 +939,8 @@ where
             }
         }
 
+        renderer.end_layer();
+
         let duration = instant.elapsed();
         log::trace!("redraw {}, {}: {:?}", view_w, view_h, duration);
     }
@@ -950,7 +973,8 @@ where
                         shell.publish(on_window_focused());
                     }
                 }
-                cosmic::iced::window::Event::RedrawRequested(_) => {
+                cosmic::iced::window::Event::RedrawRequested(now) => {
+                    update_smooth_scroll(state, *now, &mut terminal, shell);
                     if is_mouse_mode && state.dragging.is_none() {
                         state.autoscroll.stop();
                     } else {
@@ -1635,41 +1659,17 @@ where
                         terminal.scroll_as_arrows(*delta);
                         shell.capture_event();
                     } else {
-                        match delta {
-                            ScrollDelta::Lines { x: _, y } => {
-                                // High-resolution wheels deliver a notch as many
-                                // fractional deltas; accumulate them so nothing
-                                // below one whole line is lost (see
-                                // accumulate_wheel_lines).
-                                state.scroll_pixels = 0.0;
-                                let (lines, remainder) =
-                                    accumulate_wheel_lines(*y, state.scroll_lines);
-                                state.scroll_lines = remainder;
-                                if lines != 0 {
-                                    terminal.scroll(TerminalScroll::Delta(lines));
-                                }
-                                shell.capture_event();
+                        let cell_height = terminal.size().cell_height.max(1.0);
+                        let lines = match *delta {
+                            ScrollDelta::Lines { y, .. } => y * SCROLL_LINE_MULTIPLIER,
+                            //TODO: this adjustment is just a guess!
+                            ScrollDelta::Pixels { y, .. } => {
+                                y * SCROLL_LINE_MULTIPLIER / cell_height
                             }
-                            ScrollDelta::Pixels { x: _, y } => {
-                                //TODO: this adjustment is just a guess!
-                                state.scroll_lines = 0.0;
-                                state.scroll_pixels -= y * 6.0;
-                                let mut lines = 0;
-                                let metrics = terminal.with_buffer(|buffer| buffer.metrics());
-                                while state.scroll_pixels <= -metrics.line_height {
-                                    lines -= 1;
-                                    state.scroll_pixels += metrics.line_height;
-                                }
-                                while state.scroll_pixels >= metrics.line_height {
-                                    lines += 1;
-                                    state.scroll_pixels -= metrics.line_height;
-                                }
-                                if lines != 0 {
-                                    terminal.scroll(TerminalScroll::Delta(-lines));
-                                }
-                                shell.capture_event();
-                            }
-                        }
+                        };
+                        start_smooth_scroll(state, &terminal, lines);
+                        shell.capture_event();
+                        shell.request_redraw();
                     }
                     {
                         let x = p.x - self.padding.left;
@@ -1826,20 +1826,75 @@ fn update_active_regex_match(
 //TODO: this adjustment is just a guess!
 const SCROLL_LINE_MULTIPLIER: f32 = 6.0;
 
-/// Convert a wheel `Lines` delta into whole lines to scroll, accumulating the
-/// fractional remainder across events.
-///
-/// High-resolution wheels deliver a single physical notch as many fractional
-/// deltas (e.g. `y = 0.125`). Scaling by [`SCROLL_LINE_MULTIPLIER`] and
-/// truncating per event discards anything below one whole line, so most of
-/// those events would scroll nothing. Carrying the remainder forward means the
-/// fractions add up and a full notch scrolls the intended amount.
-///
-/// Returns `(whole_lines, new_accumulator)`.
-fn accumulate_wheel_lines(y: f32, accumulator: f32) -> (i32, f32) {
-    let total = accumulator + y * SCROLL_LINE_MULTIPLIER;
-    let lines = total.trunc() as i32;
-    (lines, total - lines as f32)
+/// Time constant of the exponential approach used by smooth scrolling.
+const SMOOTH_SCROLL_TAU: f32 = 0.05;
+/// Distance in lines below which the smooth scroll animation snaps to target.
+const SMOOTH_SCROLL_SNAP: f32 = 0.005;
+
+/// Rebase the smooth scroll state when the terminal's display offset changes
+/// outside of the animation (new output while scrolled, scrollbar drags, jumps).
+fn sync_smooth_scroll(state: &mut State, terminal: &Terminal) {
+    let current = terminal.display_offset() as i32;
+    let external = current - state.scroll_applied;
+    if external != 0 {
+        state.scroll_current += external as f32;
+        state.scroll_target += external as f32;
+        state.scroll_applied = current;
+    }
+}
+
+/// Extend the smooth scroll target by `lines` (positive scrolls up).
+fn start_smooth_scroll(state: &mut State, terminal: &Terminal, lines: f32) {
+    sync_smooth_scroll(state, terminal);
+    let max = terminal.history_size() as f32;
+    state.scroll_target = (state.scroll_target + lines).clamp(0.0, max);
+    state.scroll_current = state.scroll_current.clamp(0.0, max);
+}
+
+/// Advance the smooth scroll animation and request redraws until it settles.
+fn update_smooth_scroll<Message>(
+    state: &mut State,
+    now: Instant,
+    terminal: &mut Terminal,
+    shell: &mut Shell<'_, Message>,
+) {
+    sync_smooth_scroll(state, terminal);
+
+    let max = terminal.history_size() as f32;
+    state.scroll_target = state.scroll_target.clamp(0.0, max);
+    state.scroll_current = state.scroll_current.clamp(0.0, max);
+
+    if (state.scroll_target - state.scroll_current).abs() <= SMOOTH_SCROLL_SNAP {
+        state.scroll_current = state.scroll_target;
+        state.scroll_last_frame = None;
+        return;
+    }
+
+    if let Some(last) = state.scroll_last_frame {
+        let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
+        if dt > 0.0 {
+            let alpha = 1.0 - (-dt / SMOOTH_SCROLL_TAU).exp();
+            state.scroll_current += (state.scroll_target - state.scroll_current) * alpha;
+        }
+    }
+    state.scroll_last_frame = Some(now);
+
+    if (state.scroll_target - state.scroll_current).abs() <= SMOOTH_SCROLL_SNAP {
+        state.scroll_current = state.scroll_target;
+    }
+
+    let want = state.scroll_current.floor() as i32;
+    let current = terminal.display_offset() as i32;
+    if want != current {
+        terminal.scroll_smooth(want - current);
+        state.scroll_applied = terminal.display_offset() as i32;
+    }
+    if !terminal.scroll_window_covers(state.scroll_current) {
+        terminal.rebuild_scroll_window();
+    }
+    terminal.set_scroll_position(state.scroll_current);
+
+    shell.request_redraw();
 }
 
 impl<'a, Message> From<TerminalBox<'a, Message>> for Element<'a, Message, cosmic::Theme, Renderer>
@@ -2028,8 +2083,10 @@ pub struct State {
     click: Option<(ClickKind, Instant)>,
     dragging: Option<Dragging>,
     is_focused: bool,
-    scroll_pixels: f32,
-    scroll_lines: f32,
+    scroll_current: f32,
+    scroll_target: f32,
+    scroll_applied: i32,
+    scroll_last_frame: Option<Instant>,
     scrollbar_rect: Cell<Rectangle<f32>>,
     autoscroll: DragAutoscroll,
     preedit: Option<input_method::Preedit>,
@@ -2043,8 +2100,10 @@ impl State {
             click: None,
             dragging: None,
             is_focused: false,
-            scroll_pixels: 0.0,
-            scroll_lines: 0.0,
+            scroll_current: 0.0,
+            scroll_target: 0.0,
+            scroll_applied: 0,
+            scroll_last_frame: None,
             scrollbar_rect: Cell::new(Rectangle::default()),
             autoscroll: DragAutoscroll::new(AUTOSCROLL_INTERVAL),
             preedit: None,

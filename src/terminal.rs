@@ -2,7 +2,7 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener, Notify, OnResize, WindowSize},
     event_loop::{EventLoop, Msg, Notifier},
-    grid::Dimensions,
+    grid::{Dimensions, Indexed},
     index::{Boundary, Column, Direction, Line, Point, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
@@ -22,7 +22,7 @@ use cosmic::{
 };
 use cosmic_text::{
     Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, FeatureTag, FontFeatures,
-    LineEnding, ShapeRunCache, Shaping, Weight, Wrap,
+    LineEnding, Scroll, ShapeRunCache, Shaping, Weight, Wrap,
 };
 use indexmap::IndexSet;
 use std::{
@@ -54,6 +54,14 @@ pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 /// Duplicated from you guessed it.
 /// A regex expression can start or end outside the visible screen. Therefore, without this constant, some regular expressions would not match at the top and bottom.
 pub const MAX_SEARCH_LINES: usize = 100;
+
+/// Extra rows rendered above and below the viewport so smooth scrolling can
+/// move the buffer window without rebuilding it.
+const SCROLL_BUFFER_MARGIN: i32 = 16;
+
+/// Rebuild the metadata set (which forces all buffer lines to be reshaped) once
+/// it grows past this many entries, to bound per-terminal memory.
+const METADATA_COMPACT_THRESHOLD: usize = 4096;
 
 /// https://github.com/alacritty/alacritty/blob/4a7728bf7fac06a35f27f6c4f31e0d9214e5152b/alacritty/src/config/ui_config.rs#L36-L39
 fn url_regex_pattern() -> &'static str {
@@ -1244,6 +1252,45 @@ fn font_features_for(ligatures: bool) -> FontFeatures {
     features
 }
 
+/// Shift rendered lines to match the new buffer window.
+///
+/// Reuse cached lines when the window shifts within the current buffer.
+fn slide_buffer_lines(
+    buffer: &mut Buffer,
+    old_start: i32,
+    new_start: i32,
+    default_attrs: &Attrs<'static>,
+) {
+    let line_count = buffer.lines.len();
+    if line_count == 0 {
+        return;
+    }
+    let shift = new_start - old_start;
+    if shift == 0 {
+        return;
+    }
+    if shift.unsigned_abs() as usize >= line_count {
+        buffer.lines.clear();
+        return;
+    }
+    let old_lines = mem::take(&mut buffer.lines);
+    let mut new_lines = Vec::with_capacity(line_count);
+    if shift > 0 {
+        new_lines.extend(old_lines.into_iter().skip(shift as usize));
+    } else {
+        for _ in 0..shift.unsigned_abs() as usize {
+            new_lines.push(BufferLine::new(
+                "",
+                LineEnding::default(),
+                AttrsList::new(default_attrs),
+                Shaping::Advanced,
+            ));
+        }
+        new_lines.extend(old_lines);
+    }
+    buffer.lines = new_lines;
+}
+
 pub struct Terminal {
     pub context_menu: Option<MenuState>,
     pub metadata_set: IndexSet<Metadata>,
@@ -1261,6 +1308,7 @@ pub struct Terminal {
     colors: Colors,
     default_attrs: Attrs<'static>,
     dim_font_weight: Weight,
+    buffer_start_line: i32,
     mouse_reporter: MouseReporter,
     notifier: Notifier,
     search_regex_opt: Option<RegexSearch>,
@@ -1373,6 +1421,7 @@ impl Terminal {
             context_menu: None,
             default_attrs,
             dim_font_weight: Weight(dim_font_weight),
+            buffer_start_line: 0,
             metadata_set,
             mouse_reporter: Default::default(),
             needs_update: true,
@@ -1536,6 +1585,99 @@ impl Terminal {
 
     pub fn scroll(&self, scroll: TerminalScroll) {
         self.term.lock().scroll_display(scroll);
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.term.lock().grid().history_size()
+    }
+
+    pub fn buffer_start_line(&self) -> i32 {
+        self.buffer_start_line
+    }
+
+    pub fn scroll_window_covers(&self, offset: f32) -> bool {
+        let screen_lines = self.term.lock().grid().screen_lines() as f32;
+        let top = -offset - self.buffer_start_line as f32;
+        let len = self.buffer.lines.len() as f32;
+        top >= 0.0 && top + screen_lines <= len
+    }
+
+    pub fn scroll_smooth(&mut self, delta: i32) {
+        if delta != 0 {
+            self.term
+                .lock()
+                .grid_mut()
+                .scroll_display(TerminalScroll::Delta(delta));
+        }
+    }
+
+    pub fn rebuild_scroll_window(&mut self) {
+        if self.needs_update || !self.refill_scroll_window() {
+            self.update();
+        }
+        self.needs_update = false;
+    }
+
+    fn refill_scroll_window(&mut self) -> bool {
+        if self.metadata_set.len() > METADATA_COMPACT_THRESHOLD {
+            return false;
+        }
+        let display_offset = self.display_offset() as i32;
+        let (topmost, screen_lines, bottommost) = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                grid.topmost_line().0,
+                grid.screen_lines() as i32,
+                grid.bottommost_line().0,
+            )
+        };
+        let first_line = (-display_offset - SCROLL_BUFFER_MARGIN).max(topmost);
+        let shift = first_line - self.buffer_start_line;
+        let line_count = self.buffer.lines.len();
+        if shift == 0 || shift.unsigned_abs() as usize >= line_count {
+            return false;
+        }
+        let end_line = (screen_lines - 1 - display_offset + SCROLL_BUFFER_MARGIN).min(bottommost);
+        if end_line < first_line {
+            return false;
+        }
+        self.update_inner(true);
+        true
+    }
+
+    pub fn set_scroll_position(&mut self, offset: f32) {
+        let len = self.buffer.lines.len();
+        if len == 0 {
+            return;
+        }
+        let screen_lines = self.term.lock().grid().screen_lines() as f32;
+        let mut top = -offset - self.buffer_start_line as f32;
+        top = top.clamp(0.0, (len as f32 - screen_lines).max(0.0));
+        let line = top.floor() as usize;
+        let vertical = (top - line as f32) * self.size.cell_height;
+        let scroll = Scroll {
+            line,
+            vertical,
+            horizontal: 0.0,
+        };
+        let needs_shaping = self.with_buffer(|buffer| {
+            buffer.scroll() != scroll
+                || buffer
+                    .lines
+                    .get(scroll.line)
+                    .is_none_or(|line| line.shape_opt().is_none() || line.needs_reshaping())
+        });
+        if !needs_shaping {
+            return;
+        }
+        self.with_buffer_mut(|buffer| buffer.set_scroll(scroll));
+        let mut font_system = font_system().write().unwrap();
+        self.with_buffer_mut(|buffer| buffer.shape_until_scroll(font_system.raw(), false));
     }
 
     pub fn scroll_to(&self, ratio: f32) {
@@ -1802,6 +1944,10 @@ impl Terminal {
     }
 
     pub fn update(&mut self) -> bool {
+        self.update_inner(false)
+    }
+
+    fn update_inner(&mut self, scroll_only: bool) -> bool {
         // LEFT‑TO‑RIGHT ISOLATE character.
         // This will be added to the beginning of lines to force the shaper to treat detected RTL
         // lines as LTR. RTL text would still be rendered correctly. But this fixes the wrong
@@ -1810,9 +1956,15 @@ impl Terminal {
 
         let instant = Instant::now();
 
-        // Only keep default
-        self.metadata_set.truncate(1);
-        self.builtin_glyphs.clear();
+        // Keep metadata stable during scrolling; compact it when it grows too large.
+        let compact = self.metadata_set.len() > METADATA_COMPACT_THRESHOLD;
+        let scroll_only = scroll_only && !compact;
+        if compact {
+            self.metadata_set.truncate(1);
+        }
+        if !scroll_only {
+            self.builtin_glyphs.clear();
+        }
 
         // Powerline symbols are only drawn by the terminal when they keep
         // their shape at the cell metrics; otherwise the font's glyphs are
@@ -1828,7 +1980,13 @@ impl Terminal {
         {
             let buffer = Arc::make_mut(&mut self.buffer);
 
+            if compact {
+                buffer.lines.clear();
+            }
+
             let mut line_i = 0;
+            let mut render_line;
+            let mut render_range;
             let mut last_point = None;
             let mut text = String::from(LRI);
             let mut last_visible = text.len();
@@ -1854,7 +2012,64 @@ impl Terminal {
                 }
 
                 let grid = term.grid();
-                for indexed in grid.display_iter() {
+                let display_offset = grid.display_offset() as i32;
+                let first_line =
+                    (-display_offset - SCROLL_BUFFER_MARGIN).max(grid.topmost_line().0);
+                let end_line = (grid.screen_lines() as i32 - 1 - display_offset
+                    + SCROLL_BUFFER_MARGIN)
+                    .min(grid.bottommost_line().0);
+                let old_start = self.buffer_start_line;
+                let old_len = buffer.lines.len();
+                if !compact {
+                    slide_buffer_lines(buffer, old_start, first_line, &self.default_attrs);
+                }
+                self.buffer_start_line = first_line;
+                let window_len = (end_line - first_line + 1).max(0) as usize;
+                render_range = (0, window_len);
+                if scroll_only {
+                    if buffer.lines.is_empty() {
+                        self.builtin_glyphs.clear();
+                    } else {
+                        let shift = first_line - old_start;
+                        render_range = if shift < 0 {
+                            (0, ((-shift) as usize).min(window_len))
+                        } else {
+                            (
+                                ((old_len as i32 - shift).max(0) as usize).min(window_len),
+                                window_len,
+                            )
+                        };
+                        self.builtin_glyphs.retain_mut(|glyph| {
+                            let new_line = glyph.line as i64 - shift as i64;
+                            if new_line < 0 || new_line >= window_len as i64 {
+                                return false;
+                            }
+                            glyph.line = new_line as usize;
+                            true
+                        });
+                    }
+                }
+                render_line = !scroll_only || (render_range.0 == 0);
+                let columns = grid.columns();
+                let mut line = first_line;
+                let mut column = 0;
+                let display_iter = std::iter::from_fn(|| loop {
+                    if line > end_line {
+                        return None;
+                    }
+                    if column >= columns {
+                        line += 1;
+                        column = 0;
+                        continue;
+                    }
+                    let point = Point::new(Line(line), Column(column));
+                    column += 1;
+                    return Some(Indexed {
+                        point,
+                        cell: &grid[point],
+                    });
+                });
+                for indexed in display_iter {
                     if indexed.point.line != last_point.unwrap_or(indexed.point).line {
                         while line_i >= buffer.lines.len() {
                             buffer.lines.push(BufferLine::new(
@@ -1866,26 +2081,35 @@ impl Terminal {
                             buffer.set_redraw(true);
                         }
 
-                        text.truncate(last_visible);
-                        if buffer.lines[line_i].set_text(
-                            &text,
-                            LineEnding::default(),
-                            attrs_list.clone(),
-                        ) {
-                            buffer.set_redraw(true);
+                        if render_line {
+                            text.truncate(last_visible);
+                            if buffer.lines[line_i].set_text(
+                                &text,
+                                LineEnding::default(),
+                                attrs_list.clone(),
+                            ) {
+                                buffer.set_redraw(true);
+                            }
                         }
                         line_i += 1;
+                        render_line = !scroll_only
+                            || (line_i >= render_range.0 && line_i < render_range.1);
 
                         text.clear();
                         text.push(LRI);
                         last_visible = text.len();
                         attrs_list.clear_spans();
                     }
+                    if !render_line {
+                        last_point = Some(indexed.point);
+                        continue;
+                    }
                     //TODO: use indexed.point.column?
 
                     //TODO: skip leading spacer?
                     if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                         // Skip wide spacers (cells after wide characters)
+                        last_point = Some(indexed.point);
                         continue;
                     }
 
@@ -2065,9 +2289,11 @@ impl Terminal {
                 buffer.set_redraw(true);
             }
 
-            text.truncate(last_visible);
-            if buffer.lines[line_i].set_text(text, LineEnding::default(), attrs_list) {
-                buffer.set_redraw(true);
+            if render_line {
+                text.truncate(last_visible);
+                if buffer.lines[line_i].set_text(text, LineEnding::default(), attrs_list) {
+                    buffer.set_redraw(true);
+                }
             }
             line_i += 1;
 
@@ -2079,7 +2305,7 @@ impl Terminal {
             // Shape and trim shape run cache
             {
                 let mut font_system = font_system().write().unwrap();
-                buffer.shape_until_scroll(font_system.raw(), true);
+                buffer.shape_until_scroll(font_system.raw(), false);
                 font_system.raw().shape_run_cache.trim(1);
             }
         }
