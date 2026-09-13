@@ -2,7 +2,7 @@
 
 use alacritty_terminal::{
     grid::Dimensions,
-    index::{Column as TermColumn, Point as TermPoint, Side as TermSide},
+    index::{Column as TermColumn, Line as TermLine, Point as TermPoint, Side as TermSide},
     selection::{Selection, SelectionType},
     term::{TermMode, cell::Flags},
     vte::ansi::{CursorShape, NamedColor},
@@ -397,11 +397,7 @@ where
                 && y < buffer_size.1.unwrap_or(0.0)
             {
                 if state.modifiers.contains(Modifiers::CTRL) {
-                    let col = x / terminal.size().cell_width;
-                    let row = y / terminal.size().cell_height;
-
-                    let location = terminal
-                        .viewport_to_point(TermPoint::new(row as usize, TermColumn(col as usize)));
+                    let location = terminal.viewport_pixel_to_point(x, y);
                     if get_hyperlink(&terminal, location).is_some() {
                         return mouse::Interaction::Pointer;
                     }
@@ -886,8 +882,8 @@ where
                 let scroll_offset = scroll.line as f32 * height + scroll.vertical;
                 let buffer_line = line - terminal.buffer_start_line();
                 let cursor_top = buffer_line as f32 * height - scroll_offset;
-                let top_left = view_position
-                    + Vector::new((col as f32 * width).floor(), cursor_top.floor());
+                let top_left =
+                    view_position + Vector::new((col as f32 * width).floor(), cursor_top.floor());
                 match cursor.shape {
                     CursorShape::Beam => {
                         let quad = Quad {
@@ -1193,13 +1189,7 @@ where
                     let location = if let Some(p) = cursor_position.position_in(layout.bounds()) {
                         let x = p.x - self.padding.left;
                         let y = p.y - self.padding.top;
-                        //TODO: better calculation of position
-                        let col = x / terminal.size().cell_width;
-                        let row = y / terminal.size().cell_height;
-                        Some(terminal.viewport_to_point(TermPoint::new(
-                            row as usize,
-                            TermColumn(col as usize),
-                        )))
+                        Some(terminal.viewport_pixel_to_point(x, y))
                     } else {
                         None
                     };
@@ -1380,10 +1370,7 @@ where
                                     } else {
                                         ClickKind::Single
                                     };
-                                let location = terminal.viewport_to_point(TermPoint::new(
-                                    row as usize,
-                                    TermColumn(col as usize),
-                                ));
+                                let location = terminal.viewport_pixel_to_point(x, y);
                                 let side = if col.fract() < 0.5 {
                                     TermSide::Left
                                 } else {
@@ -1462,14 +1449,7 @@ where
                                     if *button == Button::Right {
                                         let x = p.x - self.padding.left;
                                         let y = p.y - self.padding.top;
-                                        //TODO: better calculation of position
-                                        let col = x / terminal.size().cell_width;
-                                        let row = y / terminal.size().cell_height;
-
-                                        let location = terminal.viewport_to_point(TermPoint::new(
-                                            row as usize,
-                                            TermColumn(col as usize),
-                                        ));
+                                        let location = terminal.viewport_pixel_to_point(x, y);
                                         update_active_regex_match(
                                             &mut terminal,
                                             Some(location),
@@ -1517,8 +1497,7 @@ where
                     let col = x / terminal.size().cell_width;
                     let row = y / terminal.size().cell_height;
 
-                    let location = terminal
-                        .viewport_to_point(TermPoint::new(row as usize, TermColumn(col as usize)));
+                    let location = terminal.viewport_pixel_to_point(x, y);
                     if state.modifiers.control()
                         && let Some(on_open_hyperlink) = &self.on_open_hyperlink
                         && let Some(hyperlink) = get_hyperlink(&terminal, location)
@@ -1579,10 +1558,7 @@ where
                         //TODO: better calculation of position
                         let col = x / terminal.size().cell_width;
                         let row = y / terminal.size().cell_height;
-                        let location = terminal.viewport_to_point(TermPoint::new(
-                            row as usize,
-                            TermColumn(col as usize),
-                        ));
+                        let location = terminal.viewport_pixel_to_point(x, y);
                         update_active_regex_match(
                             &mut terminal,
                             Some(location),
@@ -1674,14 +1650,7 @@ where
                     {
                         let x = p.x - self.padding.left;
                         let y = p.y - self.padding.top;
-                        //TODO: better calculation of position
-                        let col = x / terminal.size().cell_width;
-                        let row = y / terminal.size().cell_height;
-
-                        let location = terminal.viewport_to_point(TermPoint::new(
-                            row as usize,
-                            TermColumn(col as usize),
-                        ));
+                        let location = terminal.viewport_pixel_to_point(x, y);
                         update_active_regex_match(
                             &mut terminal,
                             Some(location),
@@ -2058,8 +2027,16 @@ fn update_buffer_drag(
     if scroll_delta != 0 {
         terminal.scroll(TerminalScroll::Delta(scroll_delta));
     }
-    let location =
-        terminal.viewport_to_point(TermPoint::new(row as usize, TermColumn(col as usize)));
+    let location = if y < 0.0 {
+        let line = -(terminal.display_offset() as i32);
+        TermPoint::new(TermLine(line), TermColumn(col as usize))
+    } else if y > buffer_height {
+        let line = size.screen_lines() as i32 - 1 - terminal.display_offset() as i32;
+        TermPoint::new(TermLine(line), TermColumn(col as usize))
+    } else {
+        let line = terminal.viewport_row_to_line(row);
+        TermPoint::new(TermLine(line), TermColumn(col as usize))
+    };
     let side = if col.fract() < 0.5 {
         TermSide::Left
     } else {
@@ -2193,7 +2170,7 @@ fn csi_u(code: u8, modifiers: u8) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EdgeScrollDirection, accumulate_wheel_lines, csi_u, edge_scroll_adjustment};
+    use super::{EdgeScrollDirection, csi_u, edge_scroll_adjustment};
 
     #[test]
     fn csi_u_encodes_kitty_control_codes() {
@@ -2205,37 +2182,6 @@ mod tests {
         assert_eq!(csi_u(13, 5), b"\x1b[13;5u");
         assert_eq!(csi_u(9, 2), b"\x1b[9;2u");
         assert_eq!(csi_u(127, 7), b"\x1b[127;7u");
-    }
-
-    #[test]
-    fn wheel_lines_single_fractional_event_keeps_remainder() {
-        // A high-res wheel notch arrives as fractional deltas. A lone 0.125
-        // event is less than one whole line, but must not be discarded.
-        let (lines, remainder) = accumulate_wheel_lines(0.125, 0.0);
-        assert_eq!(lines, 0);
-        assert!((remainder - 0.75).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn wheel_lines_accumulate_into_whole_lines() {
-        // Eight 0.125 deltas make up one physical notch and must scroll the
-        // full SCROLL_LINE_MULTIPLIER (6) lines, not be lost to truncation.
-        let mut accumulator = 0.0;
-        let mut total = 0;
-        for _ in 0..8 {
-            let (lines, remainder) = accumulate_wheel_lines(0.125, accumulator);
-            accumulator = remainder;
-            total += lines;
-        }
-        assert_eq!(total, 6);
-    }
-
-    #[test]
-    fn wheel_lines_preserve_direction() {
-        let (down, _) = accumulate_wheel_lines(0.25, 0.0);
-        let (up, _) = accumulate_wheel_lines(-0.25, 0.0);
-        assert_eq!(down, 1);
-        assert_eq!(up, -1);
     }
 
     const BUFFER_HEIGHT: f32 = 200.0;

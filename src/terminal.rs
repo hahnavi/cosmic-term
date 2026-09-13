@@ -11,7 +11,6 @@ use alacritty_terminal::{
         cell::Flags,
         color::{self, Colors},
         search::RegexSearch,
-        viewport_to_point,
     },
     tty::{self, Options},
     vte::ansi::{Color, CursorShape, NamedColor, Rgb},
@@ -2053,21 +2052,23 @@ impl Terminal {
                 let columns = grid.columns();
                 let mut line = first_line;
                 let mut column = 0;
-                let display_iter = std::iter::from_fn(|| loop {
-                    if line > end_line {
-                        return None;
+                let display_iter = std::iter::from_fn(|| {
+                    loop {
+                        if line > end_line {
+                            return None;
+                        }
+                        if column >= columns {
+                            line += 1;
+                            column = 0;
+                            continue;
+                        }
+                        let point = Point::new(Line(line), Column(column));
+                        column += 1;
+                        return Some(Indexed {
+                            point,
+                            cell: &grid[point],
+                        });
                     }
-                    if column >= columns {
-                        line += 1;
-                        column = 0;
-                        continue;
-                    }
-                    let point = Point::new(Line(line), Column(column));
-                    column += 1;
-                    return Some(Indexed {
-                        point,
-                        cell: &grid[point],
-                    });
                 });
                 for indexed in display_iter {
                     if indexed.point.line != last_point.unwrap_or(indexed.point).line {
@@ -2092,8 +2093,8 @@ impl Terminal {
                             }
                         }
                         line_i += 1;
-                        render_line = !scroll_only
-                            || (line_i >= render_range.0 && line_i < render_range.1);
+                        render_line =
+                            !scroll_only || (line_i >= render_range.0 && line_i < render_range.1);
 
                         text.clear();
                         text.push(LRI);
@@ -2315,9 +2316,24 @@ impl Terminal {
         self.buffer.redraw()
     }
 
-    pub fn viewport_to_point(&self, point: Point<usize>) -> Point {
-        let term = self.term.lock();
-        viewport_to_point(term.grid().display_offset(), point)
+    pub fn viewport_pixel_to_point(&self, x: f32, y: f32) -> Point {
+        let col = x / self.size.cell_width;
+        let row = (y / self.size.cell_height).max(0.0);
+        Point::new(
+            Line(self.viewport_row_to_line(row)),
+            Column(col.max(0.0) as usize),
+        )
+    }
+
+    pub fn viewport_row_to_line(&self, row: f32) -> i32 {
+        self.with_buffer(|buffer| {
+            line_at_viewport_row(
+                self.buffer_start_line,
+                buffer.scroll(),
+                self.size.cell_height,
+                row,
+            )
+        })
     }
 
     pub fn report_mouse(
@@ -2577,9 +2593,70 @@ impl Drop for Terminal {
     }
 }
 
+fn line_at_viewport_row(buffer_start_line: i32, scroll: Scroll, cell_height: f32, row: f32) -> i32 {
+    let vertical = if cell_height > 0.0 {
+        scroll.vertical / cell_height
+    } else {
+        0.0
+    };
+    buffer_start_line + scroll.line as i32 + (row + vertical).floor() as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hit_test_follows_fractional_smooth_scroll() {
+        const CELL_HEIGHT: f32 = 20.0;
+
+        let scroll = Scroll {
+            line: 16,
+            vertical: 0.0,
+            horizontal: 0.0,
+        };
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.0),
+            0,
+            "start of the first row"
+        );
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.99),
+            0,
+            "end of the first row"
+        );
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 1.0),
+            1,
+            "start of the second row"
+        );
+
+        let scroll = Scroll {
+            line: 15,
+            vertical: CELL_HEIGHT / 2.0,
+            horizontal: 0.0,
+        };
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.0),
+            -1,
+            "top half of a half-scrolled row"
+        );
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.49),
+            -1,
+            "still the line above"
+        );
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.5),
+            0,
+            "line below starts halfway through the row"
+        );
+        assert_eq!(
+            line_at_viewport_row(-16, scroll, CELL_HEIGHT, 1.5),
+            1,
+            "following rows stay aligned"
+        );
+    }
 
     #[test]
     fn all_block_elements_have_valid_rects() {
