@@ -1044,7 +1044,7 @@ where
                                 return;
                             }
                         }
-                        let mod_no = calculate_modifier_number(state);
+                        let mod_no = calculate_modifier_number(modifiers);
                         terminal.input_scroll(csi_u(kitty_code, mod_no));
                         shell.capture_event();
 
@@ -1052,7 +1052,7 @@ where
                     }
                 }
 
-                let mod_no = calculate_modifier_number(state);
+                let mod_no = calculate_modifier_number(modifiers);
                 let escape_code = match named {
                     Named::Insert => csi("2", "~", mod_no),
                     Named::Delete => csi("3", "~", mod_no),
@@ -1152,7 +1152,12 @@ where
                         shell.capture_event();
                     }
                     Named::Enter => {
-                        terminal.input_scroll(format!("{}{}", alt_prefix, "\x0D").into_bytes());
+                        if modifiers.shift() {
+                            let mod_no = calculate_modifier_number(modifiers);
+                            terminal.input_scroll(csi_modify_other_keys(13, mod_no));
+                        } else {
+                            terminal.input_scroll(format!("{}{}", alt_prefix, "\x0D").into_bytes());
+                        }
                         shell.capture_event();
                     }
                     Named::Escape => {
@@ -2112,18 +2117,18 @@ meta      0b100000    (32)
 caps_lock 0b1000000   (64)
 num_lock  0b10000000  (128)
 */
-fn calculate_modifier_number(state: &State) -> u8 {
+fn calculate_modifier_number(modifiers: &Modifiers) -> u8 {
     let mut mod_no = 0;
-    if state.modifiers.shift() {
+    if modifiers.shift() {
         mod_no |= 1;
     }
-    if state.modifiers.alt() {
+    if modifiers.alt() {
         mod_no |= 2;
     }
-    if state.modifiers.control() {
+    if modifiers.control() {
         mod_no |= 4;
     }
-    if state.modifiers.logo() {
+    if modifiers.logo() {
         mod_no |= 8;
     }
     mod_no + 1
@@ -2168,9 +2173,16 @@ fn csi_u(code: u8, modifiers: u8) -> Vec<u8> {
     }
 }
 
+// Encoding for modified keys that have no legacy representation:
+// CSI 27 ; modifier ; code ~
+#[inline(always)]
+fn csi_modify_other_keys(code: u8, modifiers: u8) -> Vec<u8> {
+    format!("\x1B[27;{modifiers};{code}~").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EdgeScrollDirection, csi_u, edge_scroll_adjustment};
+    use super::{EdgeScrollDirection, csi_modify_other_keys, csi_u, edge_scroll_adjustment};
 
     #[test]
     fn csi_u_encodes_kitty_control_codes() {
@@ -2182,6 +2194,15 @@ mod tests {
         assert_eq!(csi_u(13, 5), b"\x1b[13;5u");
         assert_eq!(csi_u(9, 2), b"\x1b[9;2u");
         assert_eq!(csi_u(127, 7), b"\x1b[127;7u");
+    }
+
+    #[test]
+    fn csi_modify_other_keys_encodes_modified_control_codes() {
+        // Shift+Enter has no legacy encoding.
+        assert_eq!(csi_modify_other_keys(13, 2), b"\x1b[27;2;13~");
+        // Shift+Alt maps to modifier 4, Shift+Ctrl to 6.
+        assert_eq!(csi_modify_other_keys(13, 4), b"\x1b[27;4;13~");
+        assert_eq!(csi_modify_other_keys(13, 6), b"\x1b[27;6;13~");
     }
 
     const BUFFER_HEIGHT: f32 = 200.0;
