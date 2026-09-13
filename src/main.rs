@@ -3569,6 +3569,14 @@ impl Application for App {
 
     /// Creates a view after each update.
     fn view(&self) -> Element<'_, Self::Message> {
+        for (_, tab_model) in self.pane_model.panes.panes.iter() {
+            for entity in tab_model.iter() {
+                if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                    terminal.lock().unwrap().set_visible(false);
+                }
+            }
+        }
+
         let t = self.core().system_theme();
         let cosmic = t.cosmic();
         let cosmic_theme::Spacing {
@@ -3626,6 +3634,7 @@ impl Application for App {
                 .cloned()
                 .unwrap_or_else(widget::Id::unique);
             if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
+                terminal.lock().unwrap().set_visible(true);
                 let mut terminal_box = terminal_box(terminal, &self.key_binds)
                     .id(terminal_id)
                     .disabled(self.core.window.show_context)

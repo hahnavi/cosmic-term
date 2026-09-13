@@ -31,7 +31,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, Weak,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Instant,
 };
@@ -148,15 +148,46 @@ impl From<Size> for WindowSize {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct TerminalVisibility {
+    visible: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl TerminalVisibility {
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    fn mark_pending(&self) {
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// Returns whether output arrived while the terminal was not visible.
+    pub fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
 #[derive(Clone)]
 pub struct EventProxy(
     pane_grid::Pane,
     segmented_button::Entity,
     mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, Event)>,
+    Arc<TerminalVisibility>,
 );
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
+        if !self.3.is_visible() && matches!(event, Event::Wakeup | Event::MouseCursorDirty) {
+            self.3.mark_pending();
+            return;
+        }
+
         //TODO: handle error
         let _ = self.2.send((self.0, self.1, event));
     }
@@ -1314,6 +1345,7 @@ pub struct Terminal {
     search_value: String,
     shell_pid: Option<u32>,
     size: Size,
+    visibility: Arc<TerminalVisibility>,
     font_ligatures: bool,
     use_bright_bold: bool,
     zoom_adj: i8,
@@ -1380,7 +1412,8 @@ impl Terminal {
             cell_width,
             cell_height,
         };
-        let event_proxy = EventProxy(pane, entity, event_tx);
+        let visibility = Arc::new(TerminalVisibility::default());
+        let event_proxy = EventProxy(pane, entity, event_tx, visibility.clone());
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &size,
@@ -1430,6 +1463,7 @@ impl Terminal {
             search_value: String::new(),
             shell_pid,
             size,
+            visibility,
             tab_title_override,
             term,
             font_ligatures,
@@ -1504,6 +1538,13 @@ impl Terminal {
                 let input = if is_focused { FOCUS_IN } else { FOCUS_OUT };
                 self.input_no_scroll(input);
             }
+        }
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visibility.set_visible(visible);
+        if visible && self.visibility.take_pending() {
+            self.needs_update = true;
         }
     }
 
