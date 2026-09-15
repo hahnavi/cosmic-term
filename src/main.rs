@@ -2146,34 +2146,41 @@ impl Application for App {
                     self.file_chooser_pending = true;
                     self.color_scheme_errors.clear();
                     let file_name = format!("{}.ron", color_scheme_name);
-                    return cosmic::task::future(async move {
-                        let dialog = file_chooser::save::Dialog::new()
-                            .title(fl!("export"))
-                            .file_name(file_name);
+                    let window_id = self.core.main_window_id().unwrap_or(window::Id::RESERVED);
+                    return cosmic::window::identifier(window_id).then(move |identifier| {
+                        let file_name = file_name.clone();
+                        cosmic::task::future(async move {
+                            let dialog = file_chooser::save::Dialog::new()
+                                .title(fl!("export"))
+                                .file_name(file_name)
+                                .identifier(identifier);
 
-                        let outcome = match dialog.save_file().await {
-                            Ok(response) => match response.url() {
-                                Some(url) => match url.to_file_path() {
-                                    Ok(path) => FileChooserOutcome::Selected(path),
-                                    Err(()) => FileChooserOutcome::Failed(format!(
-                                        "Save dialog returned non-local URL {url}"
-                                    )),
+                            let outcome = match dialog.save_file().await {
+                                Ok(response) => match response.url() {
+                                    Some(url) => match url.to_file_path() {
+                                        Ok(path) => FileChooserOutcome::Selected(path),
+                                        Err(()) => FileChooserOutcome::Failed(format!(
+                                            "Save dialog returned non-local URL {url}"
+                                        )),
+                                    },
+                                    None => FileChooserOutcome::Failed(
+                                        "Save dialog did not return a file".to_string(),
+                                    ),
                                 },
-                                None => FileChooserOutcome::Failed(
-                                    "Save dialog did not return a file".to_string(),
-                                ),
-                            },
-                            Err(file_chooser::Error::Cancelled) => FileChooserOutcome::Cancelled,
-                            Err(why) => {
-                                FileChooserOutcome::Failed(format!("Save dialog failed: {why}"))
-                            }
-                        };
+                                Err(file_chooser::Error::Cancelled) => {
+                                    FileChooserOutcome::Cancelled
+                                }
+                                Err(why) => {
+                                    FileChooserOutcome::Failed(format!("Save dialog failed: {why}"))
+                                }
+                            };
 
-                        Message::ColorSchemeExportResult(
-                            color_scheme_kind,
-                            color_scheme_id_opt,
-                            outcome,
-                        )
+                            Message::ColorSchemeExportResult(
+                                color_scheme_kind,
+                                color_scheme_id_opt,
+                                outcome,
+                            )
+                        })
                     });
                 }
             }
@@ -2275,35 +2282,45 @@ impl Application for App {
                 if !self.file_chooser_pending {
                     self.file_chooser_pending = true;
                     self.color_scheme_errors.clear();
-                    return cosmic::task::future(async move {
-                        let dialog = file_chooser::open::Dialog::new().title(fl!("import"));
+                    let window_id = self.core.main_window_id().unwrap_or(window::Id::RESERVED);
+                    return cosmic::window::identifier(window_id).then(move |identifier| {
+                        cosmic::task::future(async move {
+                            let dialog = file_chooser::open::Dialog::new()
+                                .title(fl!("import"))
+                                .identifier(identifier);
 
-                        let outcome = match dialog.open_files().await {
-                            Ok(response) => {
-                                let mut paths = Vec::with_capacity(response.urls().len());
-                                for url in response.urls() {
-                                    match url.to_file_path() {
-                                        Ok(path) => paths.push(path),
-                                        Err(()) => {
-                                            log::error!("open dialog returned non-local URL {url}")
+                            let outcome = match dialog.open_files().await {
+                                Ok(response) => {
+                                    let mut paths = Vec::with_capacity(response.urls().len());
+                                    for url in response.urls() {
+                                        match url.to_file_path() {
+                                            Ok(path) => paths.push(path),
+                                            Err(()) => {
+                                                log::error!(
+                                                    "open dialog returned non-local URL {url}"
+                                                )
+                                            }
                                         }
                                     }
+                                    if paths.is_empty() {
+                                        FileChooserOutcome::Failed(
+                                            "Open dialog did not return any local files"
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        FileChooserOutcome::Selected(paths)
+                                    }
                                 }
-                                if paths.is_empty() {
-                                    FileChooserOutcome::Failed(
-                                        "Open dialog did not return any local files".to_string(),
-                                    )
-                                } else {
-                                    FileChooserOutcome::Selected(paths)
+                                Err(file_chooser::Error::Cancelled) => {
+                                    FileChooserOutcome::Cancelled
                                 }
-                            }
-                            Err(file_chooser::Error::Cancelled) => FileChooserOutcome::Cancelled,
-                            Err(why) => {
-                                FileChooserOutcome::Failed(format!("Open dialog failed: {why}"))
-                            }
-                        };
+                                Err(why) => {
+                                    FileChooserOutcome::Failed(format!("Open dialog failed: {why}"))
+                                }
+                            };
 
-                        Message::ColorSchemeImportResult(color_scheme_kind, outcome)
+                            Message::ColorSchemeImportResult(color_scheme_kind, outcome)
+                        })
                     });
                 }
             }
