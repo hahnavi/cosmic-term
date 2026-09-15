@@ -4,11 +4,11 @@ use i18n_embed::{
     DefaultLocalizer, LanguageLoader, Localizer,
     fluent::{FluentLanguageLoader, fluent_language_loader},
 };
-use icu::collator::{
+use icu_collator::{
     Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions,
     preferences::CollationNumericOrdering,
 };
-use icu::locale::Locale;
+use icu_locale::Locale;
 use rust_embed::RustEmbed;
 use std::sync::LazyLock;
 

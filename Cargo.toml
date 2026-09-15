@@ -26,7 +26,8 @@ i18n-embed = { version = "0.16", features = [
     "desktop-requester",
 ] }
 i18n-embed-fl = "0.10"
-icu = { version = "2.1.1", features = ["compiled_data"] }
+icu_collator = { version = "2.3", features = ["compiled_data"] }
+icu_locale = { version = "2.3", features = ["compiled_data"] }
 rust-embed = "8"
 url = "2.5"
 secret-service = { version = "5.1.0", features = [
@@ -34,11 +35,6 @@ secret-service = { version = "5.1.0", features = [
 ], optional = true }
 thiserror = { version = "2.0", optional = true }
 secstr = { version = "0.5", optional = true }
-
-[dependencies.cosmic-files]
-git = "https://github.com/hahnavi/cosmic-files.git"
-branch = "hahnavi"
-default-features = false
 
 [dependencies.cosmic-text]
 version = "0.19"
@@ -56,6 +52,7 @@ features = [
     "tokio",
     "winit",
     "surface-message",
+    "xdg-portal",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -67,8 +64,8 @@ xdgen = "0.1"
 [features]
 default = ["dbus-config", "wgpu", "wayland"]
 dbus-config = ["libcosmic/dbus-config"]
-wgpu = ["libcosmic/wgpu", "cosmic-files/wgpu"]
-wayland = ["libcosmic/wayland", "cosmic-files/wayland"]
+wgpu = ["libcosmic/wgpu"]
+wayland = ["libcosmic/wayland"]
 password_manager = ["secret-service", "thiserror", "secstr"]
 
 [profile.release]
@@ -76,6 +73,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release-with-debug]
 inherits = "release"

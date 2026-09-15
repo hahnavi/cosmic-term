@@ -149,9 +149,11 @@ pub fn color_scheme_menu<'a>(
     kind: ColorSchemeKind,
     id_opt: Option<ColorSchemeId>,
     name: &str,
+    enabled: bool,
 ) -> Element<'a, Message> {
-    let menu_item =
-        |label, message| menu_button(vec![widget::text(label).into()]).on_press(message);
+    let menu_item = |label, message| {
+        menu_button(vec![widget::text(label).into()]).on_press_maybe(enabled.then_some(message))
+    };
 
     let mut column =
         widget::menu::menu_column::MenuColumn::with_capacity(if id_opt.is_some() { 3 } else { 1 });
