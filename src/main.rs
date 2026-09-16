@@ -41,7 +41,7 @@ use std::{
     path::PathBuf,
     process,
     rc::Rc,
-    sync::{LazyLock, Mutex, atomic::Ordering},
+    sync::{Arc, LazyLock, Mutex, atomic::Ordering},
 };
 use tokio::sync::mpsc;
 
@@ -198,8 +198,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         env::set_var("TERM", "xterm-256color");
     }
 
-    // Pre-spawn the PTY for the first terminal so the shell initializes while the app launches.
-    let startup_pty = {
+    // Pre-spawn the PTY for the first terminal so the shell initializes while
+    // the app launches. This is done on a worker thread because computing the
+    // initial terminal size requires initializing the whole font system
+    // (~10ms); doing that here would delay connecting to the display server.
+    let startup_pty: Arc<Mutex<Option<StartupPty>>> = Arc::new(Mutex::new(None));
+    {
         let profile = config
             .default_profile
             .and_then(|profile_id| config.profiles.get(&profile_id));
@@ -208,15 +212,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             profile,
             None,
         );
-        let size = terminal::startup_terminal_size(&config);
-        match tty::new(&options, size.into(), 0) {
-            Ok(pty) => Some(StartupPty { pty, options, size }),
-            Err(err) => {
-                log::error!("failed to pre-spawn terminal: {}", err);
-                None
-            }
-        }
-    };
+        let thread_config = config.clone();
+        let slot = startup_pty.clone();
+        std::thread::Builder::new()
+            .name("terminal-pre-spawn".into())
+            .spawn(move || {
+                let size = terminal::startup_terminal_size(&thread_config);
+                let result = match tty::new(&options, size.into(), 0) {
+                    Ok(pty) => Some(StartupPty { pty, options, size }),
+                    Err(err) => {
+                        log::error!("failed to pre-spawn terminal: {}", err);
+                        None
+                    }
+                };
+                *slot.lock().unwrap() = result;
+            })
+            .expect("spawn terminal pre-spawn worker");
+    }
 
     // Set settings
     let mut settings = Settings::default();
@@ -257,8 +269,60 @@ pub struct Flags {
     config: Config,
     shortcuts_config: shortcuts::ShortcutsConfig,
     startup_options: Option<tty::Options>,
-    startup_pty: Option<StartupPty>,
+    startup_pty: Arc<Mutex<Option<StartupPty>>>,
     term_config: term::Config,
+}
+
+struct FontCatalog {
+    font_names: Vec<String>,
+    font_name_faces_map: BTreeMap<String, Vec<FaceInfo>>,
+}
+
+fn build_font_catalog() -> FontCatalog {
+    let mut font_name_faces_map = BTreeMap::<_, Vec<_>>::new();
+    {
+        let mut font_system = font_system().write().unwrap();
+        //TODO: do not repeat, used in Tab::new
+        for face in font_system.raw().db().faces() {
+            // only monospace fonts and weights that match named constants.
+            let weight = face.weight.0;
+            if face.monospaced && { 1..9 }.contains(&{ weight / 100 }) && weight % 100 == 0 {
+                //TODO: get localized name if possible
+                let font_name = face
+                    .families
+                    .first()
+                    .map_or_else(|| face.post_script_name.to_string(), |x| x.0.to_string());
+                font_name_faces_map
+                    .entry(font_name)
+                    .or_default()
+                    .push(face.clone());
+            }
+        }
+    }
+
+    // Keep only fonts with both NORMAL and BOLD faces at `Stretch::Normal`; this matters for fallbacks.
+    font_name_faces_map.retain(|_, v| {
+        let has_normal = v
+            .iter()
+            .any(|face| face.weight == Weight::NORMAL && face.stretch == Stretch::Normal);
+        let has_bold = v
+            .iter()
+            .any(|face| face.weight == Weight::BOLD && face.stretch == Stretch::Normal);
+        has_normal && has_bold
+    });
+
+    if font_name_faces_map.is_empty() {
+        log::error!(
+            "at least one monospace font with normal/bold weights and default stretch is required"
+        );
+        log::error!("no monospace fonts to select from, exiting");
+        process::exit(1);
+    }
+
+    FontCatalog {
+        font_names: font_name_faces_map.keys().cloned().collect(),
+        font_name_faces_map,
+    }
 }
 
 struct StartupPty {
@@ -593,7 +657,7 @@ pub struct App {
     term_event_tx_opt:
         Option<mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, TermEvent)>>,
     startup_options: Option<tty::Options>,
-    startup_pty: Option<StartupPty>,
+    startup_pty: Arc<Mutex<Option<StartupPty>>>,
     term_config: term::Config,
     file_chooser_pending: bool,
     color_scheme_errors: Vec<String>,
@@ -943,6 +1007,15 @@ impl App {
     }
 
     fn set_curr_font_weights_and_stretches(&mut self) {
+        if self.font_name_faces_map.is_empty() {
+            let FontCatalog {
+                font_names,
+                font_name_faces_map,
+            } = build_font_catalog();
+            self.font_names = font_names;
+            self.font_name_faces_map = font_name_faces_map;
+        }
+
         // check if config font_name is available first, if not, set it to first name in list
         if !self.font_names.contains(&self.config.font_name) {
             log::error!("'{}' is not in the font list", self.config.font_name);
@@ -1736,6 +1809,8 @@ impl App {
 
                             let startup_pty = self
                                 .startup_pty
+                                .lock()
+                                .unwrap()
                                 .take()
                                 .filter(|startup_pty| startup_pty.options == options);
 
@@ -1846,61 +1921,10 @@ impl Application for App {
         core.window.content_container = false;
         core.window.show_headerbar = flags.config.show_headerbar;
 
-        // Update font name from config
-        {
-            let mut font_system = font_system().write().unwrap();
-            font_system
-                .raw()
-                .db_mut()
-                .set_monospace_family(&flags.config.font_name);
-        }
-
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
 
-        let font_name_faces_map = {
-            let mut font_name_faces_map = BTreeMap::<_, Vec<_>>::new();
-            let mut font_system = font_system().write().unwrap();
-            //TODO: do not repeat, used in Tab::new
-            for face in font_system.raw().db().faces() {
-                // only monospace fonts and weights that match named constants.
-                let weight = face.weight.0;
-                if face.monospaced && { 1..9 }.contains(&{ weight / 100 }) && weight % 100 == 0 {
-                    //TODO: get localized name if possible
-                    let font_name = face
-                        .families
-                        .first()
-                        .map_or_else(|| face.post_script_name.to_string(), |x| x.0.to_string());
-                    font_name_faces_map
-                        .entry(font_name)
-                        .or_default()
-                        .push(face.clone());
-                }
-            }
-
-            // only keep fonts that have both NORMAL and BOLD weights with both having
-            // a `Stretch::Normal` face.
-            // This is important for fallbacks.
-            font_name_faces_map.retain(|_, v| {
-                let has_normal = v
-                    .iter()
-                    .any(|face| face.weight == Weight::NORMAL && face.stretch == Stretch::Normal);
-                let has_bold = v
-                    .iter()
-                    .any(|face| face.weight == Weight::BOLD && face.stretch == Stretch::Normal);
-                has_normal && has_bold
-            });
-            font_name_faces_map
-        };
-
-        if font_name_faces_map.is_empty() {
-            log::error!(
-                "at least one monospace font with normal/bold weights and default stretch is required"
-            );
-            log::error!("no monospace fonts to select from, exiting");
-            process::exit(1);
-        }
-
-        let font_names = font_name_faces_map.keys().cloned().collect();
+        let font_names = Vec::new();
+        let font_name_faces_map = BTreeMap::<String, Vec<FaceInfo>>::new();
 
         let mut font_size_names = Vec::new();
         let mut font_sizes = Vec::new();
@@ -2029,7 +2053,6 @@ impl Application for App {
             password_mgr: Default::default(),
         };
 
-        app.set_curr_font_weights_and_stretches();
         let command = Task::batch([app.update_config(), app.update_title(None)]);
 
         (app, command)
@@ -3418,11 +3441,22 @@ impl Application for App {
                             self.password_mgr.clear();
                         }
                     }
+
+                    if self.core.window.show_context {
+                        if let ContextPage::Settings = context_page {
+                            self.set_curr_font_weights_and_stretches();
+                        }
+                    }
+
                     return self.update_focus();
                 } else {
                     self.context_page = context_page;
                     self.core.window.show_context = true;
                     self.pane_model.unfocus_all_terminals();
+                }
+
+                if let ContextPage::Settings = context_page {
+                    self.set_curr_font_weights_and_stretches();
                 }
 
                 // Extra work to do to prepare context pages
