@@ -116,7 +116,7 @@ pub struct TerminalBox<'a, Message> {
     show_headerbar: bool,
     pane_border_radius: Option<Radius>,
     click_timing: Duration,
-    context_menu: Option<Point>,
+    context_menu_open: bool,
     on_context_menu: Option<Box<dyn Fn(Option<MenuState>) -> Message + 'a>>,
     on_mouse_enter: Option<Box<dyn Fn() -> Message + 'a>>,
     opacity: Option<f32>,
@@ -143,7 +143,7 @@ where
             show_headerbar: true,
             pane_border_radius: None,
             click_timing: Duration::from_millis(500),
-            context_menu: None,
+            context_menu_open: false,
             on_context_menu: None,
             on_mouse_enter: None,
             opacity: None,
@@ -188,8 +188,8 @@ where
         self
     }
 
-    pub fn context_menu(mut self, position: Point) -> Self {
-        self.context_menu = Some(position);
+    pub fn context_menu_open(mut self, open: bool) -> Self {
+        self.context_menu_open = open;
         self
     }
 
@@ -253,7 +253,7 @@ where
         if !state.is_focused {
             return InputMethod::Disabled;
         }
-        if self.context_menu.is_some() {
+        if self.context_menu_open {
             return InputMethod::Disabled;
         }
 
@@ -1446,11 +1446,11 @@ where
                         }
                         // Update context menu state
                         if let Some(on_context_menu) = &self.on_context_menu {
-                            match self.context_menu {
-                                Some(_) => {
+                            match self.context_menu_open {
+                                true => {
                                     shell.publish(on_context_menu(None));
                                 }
-                                None => {
+                                false => {
                                     if *button == Button::Right {
                                         let x = p.x - self.padding.left;
                                         let y = p.y - self.padding.top;
@@ -1461,15 +1461,7 @@ where
                                             None,
                                         );
                                         let link = get_hyperlink(&terminal, location);
-                                        let abs = cosmic::iced::Point::new(
-                                            layout.bounds().x + p.x,
-                                            layout.bounds().y + p.y,
-                                        );
-                                        shell.publish(on_context_menu(Some(MenuState {
-                                            position: Some(abs),
-                                            local_position: Some(p),
-                                            link,
-                                        })));
+                                        shell.publish(on_context_menu(Some(MenuState { link })));
                                     }
                                 }
                             }
