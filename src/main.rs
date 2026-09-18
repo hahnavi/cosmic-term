@@ -32,7 +32,7 @@ use cosmic_text::{Family, ShapeRunCache, Stretch, Weight, fontdb::FaceInfo};
 use localize::LANGUAGE_SORTER;
 use std::{
     any::TypeId,
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp,
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
@@ -621,6 +621,19 @@ struct ShortcutConflict {
     new_action: shortcuts::KeyBindAction,
 }
 
+/// Cached terminal context-menu contents for one tab.
+///
+/// The menu is handed to libcosmic's context menu widget every frame so it can
+/// open on the right-button press. Rebuilding it (fluent lookups plus the
+/// key-bind map) each frame is wasteful, so cache it until its inputs change.
+struct ContextMenuCacheEntry {
+    entity: segmented_button::Entity,
+    link: Option<String>,
+    show_headerbar: bool,
+    menu_revision: u64,
+    trees: Vec<widget::menu::Tree<Message>>,
+}
+
 /// The [`App`] stores application-specific state.
 pub struct App {
     core: Core,
@@ -631,6 +644,7 @@ pub struct App {
     shortcuts_config: shortcuts::ShortcutsConfig,
     key_binds: HashMap<KeyBind, Action>,
     menu_revision: u64,
+    context_menu_cache: RefCell<HashMap<pane_grid::Pane, ContextMenuCacheEntry>>,
     app_themes: Vec<String>,
     font_names: Vec<String>,
     font_size_names: Vec<String>,
@@ -1997,6 +2011,7 @@ impl Application for App {
             shortcuts_config: flags.shortcuts_config,
             key_binds,
             menu_revision: 0,
+            context_menu_cache: RefCell::new(HashMap::new()),
             app_themes,
             font_names,
             font_size_names,
@@ -3669,18 +3684,50 @@ impl Application for App {
                 if menu_state.is_some() {
                     terminal_box = terminal_box.context_menu_open(true);
                 }
-                let mut context_menu = widget::context_menu(
-                    terminal_box,
-                    Some(menu::context_menu(
-                        &self.config,
-                        &self.key_binds,
-                        entity,
-                        link,
-                    )),
-                )
-                .item_width(widget::menu::ItemWidth::Uniform(360))
-                .on_close(Message::TabContextMenu(pane, None))
-                .on_surface_action(Message::Surface);
+                // Reuse the built menu until its inputs change; it is handed to
+                // the widget every frame so the popup can open on press.
+                let menu_trees = {
+                    let cached =
+                        self.context_menu_cache
+                            .borrow()
+                            .get(&pane)
+                            .is_some_and(|entry| {
+                                entry.entity == entity
+                                    && entry.link == link
+                                    && entry.show_headerbar == self.config.show_headerbar
+                                    && entry.menu_revision == self.menu_revision
+                            });
+                    if cached {
+                        self.context_menu_cache
+                            .borrow()
+                            .get(&pane)
+                            .unwrap()
+                            .trees
+                            .clone()
+                    } else {
+                        let trees = menu::context_menu(
+                            &self.config,
+                            &self.key_binds,
+                            entity,
+                            link.clone(),
+                        );
+                        self.context_menu_cache.borrow_mut().insert(
+                            pane,
+                            ContextMenuCacheEntry {
+                                entity,
+                                link,
+                                show_headerbar: self.config.show_headerbar,
+                                menu_revision: self.menu_revision,
+                                trees: trees.clone(),
+                            },
+                        );
+                        trees
+                    }
+                };
+                let mut context_menu = widget::context_menu(terminal_box, Some(menu_trees))
+                    .item_width(widget::menu::ItemWidth::Uniform(360))
+                    .on_close(Message::TabContextMenu(pane, None))
+                    .on_surface_action(Message::Surface);
                 if let Some(window_id) = self.core.main_window_id() {
                     context_menu = context_menu.window_id(window_id);
                 }
