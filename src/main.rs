@@ -3658,22 +3658,25 @@ impl Application for App {
                     terminal_box = terminal_box.on_mouse_enter(move || Message::MouseEnter(pane));
                 }
 
-                // The terminal records what was under the right press; the widget opens the
-                // menu on release, so build it from that state
-                let context_link = terminal
-                    .lock()
-                    .unwrap()
-                    .context_menu
+                // Build the menu up front, including the link currently under
+                // the pointer, so the widget can open it on the right-button
+                // press instead of waiting for the release.
+                let menu_state = terminal.lock().unwrap().context_menu.clone();
+                let link = menu_state
                     .as_ref()
-                    .map(|menu_state| menu_state.link.clone());
-                if context_link.is_some() {
+                    .and_then(|menu_state| menu_state.link.clone())
+                    .or_else(|| terminal.lock().unwrap().hovered_link.clone());
+                if menu_state.is_some() {
                     terminal_box = terminal_box.context_menu_open(true);
                 }
                 let mut context_menu = widget::context_menu(
                     terminal_box,
-                    context_link.map(|link| {
-                        menu::context_menu(&self.config, &self.key_binds, entity, link)
-                    }),
+                    Some(menu::context_menu(
+                        &self.config,
+                        &self.key_binds,
+                        entity,
+                        link,
+                    )),
                 )
                 .item_width(widget::menu::ItemWidth::Uniform(360))
                 .on_close(Message::TabContextMenu(pane, None))

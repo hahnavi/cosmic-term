@@ -1561,8 +1561,10 @@ where
                             Some(location),
                             Some(&state.modifiers),
                         );
+                        terminal.hovered_link = get_hyperlink(&terminal, location);
                         Some((col, row))
                     } else {
+                        terminal.hovered_link = None;
                         None
                     };
 
@@ -1653,6 +1655,7 @@ where
                             Some(location),
                             Some(&state.modifiers),
                         );
+                        terminal.hovered_link = get_hyperlink(&terminal, location);
                     }
                 }
             }

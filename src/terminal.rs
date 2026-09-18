@@ -1332,6 +1332,9 @@ pub struct Terminal {
     pub regex_matches: Vec<alacritty_terminal::term::search::Match>,
     pub active_regex_match: Option<alacritty_terminal::term::search::Match>,
     pub active_hyperlink_id: Option<String>,
+    /// The hyperlink under the pointer, tracked on cursor movement so the
+    /// context menu can include link actions before the right-click arrives.
+    pub hovered_link: Option<String>,
     bold_font_weight: Weight,
     buffer: Arc<Buffer>,
     is_focused: bool,
@@ -1445,6 +1448,7 @@ impl Terminal {
         Ok(Self {
             active_regex_match: None,
             active_hyperlink_id: None,
+            hovered_link: None,
             regex_matches: Vec::new(),
             builtin_glyphs: Vec::new(),
             bold_font_weight: Weight(bold_font_weight),
