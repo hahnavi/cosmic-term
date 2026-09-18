@@ -743,6 +743,8 @@ where
             position: view_position,
             color: Color::from_rgba(1.0, 1.0, 1.0, 1.0), // TODO
             clip_bounds: Rectangle::new(view_position, Size::new(view_w as f32, view_h as f32)),
+            // Filled in by the renderer's `snapshot` when the raw text is drawn.
+            content_hash: 0,
         });
 
         // Render custom glyph quads above the text buffer.
