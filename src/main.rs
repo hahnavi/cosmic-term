@@ -46,8 +46,8 @@ use std::{
 use tokio::sync::mpsc;
 
 use config::{
-    AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, Profile,
-    ProfileId,
+    AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, GraphicsMode,
+    Profile, ProfileId,
 };
 mod config;
 mod mouse_reporter;
@@ -197,6 +197,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe {
         env::set_var("TERM", "xterm-256color");
     }
+    configure_graphics_mode(config.graphics_mode);
 
     // Pre-spawn the PTY for the first terminal so the shell initializes while
     // the app launches. This is done on a worker thread because computing the
@@ -262,6 +263,24 @@ Options:
   --version                       Show the version of cosmic-term
   -w, --working-directory <dir>   Set the working directory for the terminal"#
     );
+}
+
+fn configure_graphics_mode(mode: GraphicsMode) {
+    unsafe {
+        match mode {
+            GraphicsMode::HighPerformance => {
+                env::set_var("WGPU_POWER_PREF", "high");
+                env::remove_var("ICED_BACKEND");
+            }
+            GraphicsMode::LowPower => {
+                env::set_var("WGPU_POWER_PREF", "low");
+                env::remove_var("ICED_BACKEND");
+            }
+            GraphicsMode::Software => {
+                env::set_var("ICED_BACKEND", "tiny-skia");
+            }
+        }
+    }
 }
 
 pub struct Flags {
@@ -497,6 +516,7 @@ pub enum FileChooserOutcome<T> {
 #[derive(Clone, Debug)]
 pub enum Message {
     AppTheme(AppTheme),
+    GraphicsModeChanged(GraphicsMode),
     ClearScrollback(Option<segmented_button::Entity>),
     ColorSchemeCollapse,
     ColorSchemeDelete(ColorSchemeKind, ColorSchemeId),
@@ -646,6 +666,7 @@ pub struct App {
     menu_revision: u64,
     context_menu_cache: RefCell<HashMap<pane_grid::Pane, ContextMenuCacheEntry>>,
     app_themes: Vec<String>,
+    graphics_mode_names: Vec<String>,
     font_names: Vec<String>,
     font_size_names: Vec<String>,
     font_sizes: Vec<u16>,
@@ -1724,6 +1745,25 @@ impl App {
         let advanced_section = widget::settings::section()
             .title(fl!("advanced"))
             .add(
+                widget::settings::item::builder(fl!("graphics-mode"))
+                    .description(fl!("graphics-mode-description"))
+                    .control(widget::dropdown(
+                        &self.graphics_mode_names,
+                        Some(match self.config.graphics_mode {
+                            GraphicsMode::LowPower => 0,
+                            GraphicsMode::HighPerformance => 1,
+                            GraphicsMode::Software => 2,
+                        }),
+                        |index| {
+                            Message::GraphicsModeChanged(match index {
+                                1 => GraphicsMode::HighPerformance,
+                                2 => GraphicsMode::Software,
+                                _ => GraphicsMode::LowPower,
+                            })
+                        },
+                    )),
+            )
+            .add(
                 widget::settings::item::builder(fl!("show-headerbar"))
                     .description(fl!("show-header-description"))
                     .toggler(self.config.show_headerbar, Message::ShowHeaderBar),
@@ -1824,6 +1864,9 @@ impl App {
                                     tab_title_override
                                         .clone()
                                         .unwrap_or_else(|| fl!("new-terminal")),
+                                )
+                                .icon(
+                                    widget::icon::from_name("utilities-terminal-symbolic").icon(),
                                 )
                                 .closable()
                                 .activate()
@@ -1926,6 +1969,11 @@ impl Application for App {
         core.window.show_headerbar = flags.config.show_headerbar;
 
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
+        let graphics_mode_names = vec![
+            fl!("graphics-mode-low-power"),
+            fl!("graphics-mode-high-performance"),
+            fl!("graphics-mode-software"),
+        ];
 
         let font_names = Vec::new();
         let font_name_faces_map = BTreeMap::<String, Vec<FaceInfo>>::new();
@@ -2013,6 +2061,7 @@ impl Application for App {
             menu_revision: 0,
             context_menu_cache: RefCell::new(HashMap::new()),
             app_themes,
+            graphics_mode_names,
             font_names,
             font_size_names,
             font_sizes,
@@ -2138,6 +2187,11 @@ impl Application for App {
             Message::AppTheme(app_theme) => {
                 config_set!(app_theme, app_theme);
                 return self.update_config();
+            }
+            Message::GraphicsModeChanged(graphics_mode) => {
+                if graphics_mode != self.config.graphics_mode {
+                    config_set!(graphics_mode, graphics_mode);
+                }
             }
             Message::ClearScrollback(entity_opt) => {
                 if let Some(tab_model) = self.pane_model.active() {
@@ -2872,7 +2926,7 @@ impl Application for App {
                         let terminal = terminal.lock().unwrap();
                         terminal.paste(password.into_unsecure());
                         terminal.input_scroll(b"\n".as_slice());
-                        self.core.window.show_context = false;
+                        self.set_show_context(false);
                         self.password_mgr.clear();
                     }
                 }
@@ -3349,7 +3403,8 @@ impl Application for App {
             }
             Message::ToggleContextPage(context_page) => {
                 if self.context_page == context_page {
-                    self.core.window.show_context = !self.core.window.show_context;
+                    let show_context = !self.core.window.show_context;
+                    self.set_show_context(show_context);
                     self.pane_model.update_terminal_focus();
 
                     if let ContextPage::KeyboardShortcuts = context_page {
@@ -3358,7 +3413,7 @@ impl Application for App {
 
                     #[cfg(feature = "password_manager")]
                     if ContextPage::PasswordManager == context_page {
-                        if self.core.window.show_context {
+                        if show_context {
                             self.password_mgr.pane = Some(self.pane_model.focused());
                             return self.password_mgr.refresh_password_list();
                         } else {
@@ -3366,7 +3421,7 @@ impl Application for App {
                         }
                     }
 
-                    if self.core.window.show_context {
+                    if show_context {
                         if let ContextPage::Settings = context_page {
                             self.set_curr_font_weights_and_stretches();
                         }
@@ -3375,7 +3430,7 @@ impl Application for App {
                     return self.update_focus();
                 } else {
                     self.context_page = context_page;
-                    self.core.window.show_context = true;
+                    self.set_show_context(true);
                     self.pane_model.unfocus_all_terminals();
                 }
 
@@ -3595,6 +3650,7 @@ impl Application for App {
         let t = self.core().system_theme();
         let cosmic = t.cosmic();
         let cosmic_theme::Spacing {
+            space_s,
             space_xxxs,
             space_xxs,
             ..
@@ -3619,8 +3675,10 @@ impl Application for App {
                             .enable_tab_drag(String::from("x-cosmic-term/tab"))
                             .on_reorder(move |event| Message::ReorderTab(pane, event))
                             .tab_drag_threshold(25.)
-                            .button_height(32)
-                            .button_spacing(space_xxs)
+                            .button_height(36)
+                            .button_spacing(space_s)
+                            .width(Length::Fill)
+                            .button_alignment(Alignment::Center)
                             .on_activate(Message::TabActivate)
                             .on_close(|entity| Message::TabClose(Some(entity))),
                     )
@@ -3637,7 +3695,22 @@ impl Application for App {
                             snap: true,
                         }
                     })))
+                    .padding([0, space_xxs, 0, space_xxs])
                     .width(Length::Fill),
+                );
+                tab_column = tab_column.push(
+                    widget::container(
+                        widget::divider::horizontal::default().class(style::Rule::custom(
+                            |theme| iced::widget::rule::Style {
+                                color: theme.cosmic().accent.base.into(),
+                                radius: 0.0.into(),
+                                fill_mode: iced::widget::rule::FillMode::Full,
+                                snap: true,
+                            },
+                        )),
+                    )
+                    .width(Length::Fill)
+                    .padding([0, space_xxs]),
                 );
             }
 

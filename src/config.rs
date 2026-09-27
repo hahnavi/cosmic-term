@@ -24,6 +24,14 @@ pub enum AppTheme {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum GraphicsMode {
+    #[default]
+    LowPower,
+    HighPerformance,
+    Software,
+}
+
 impl AppTheme {
     pub fn theme(&self) -> theme::Theme {
         match self {
@@ -238,6 +246,8 @@ pub struct Config {
     #[serde(default = "font_ligatures_default")]
     pub font_ligatures: bool,
     pub font_size_zoom_step_mul_100: u16,
+    #[serde(default)]
+    pub graphics_mode: GraphicsMode,
     pub opacity: u8,
     pub profiles: BTreeMap<ProfileId, Profile>,
     #[serde(default = "scrollback_lines_default")]
@@ -269,6 +279,7 @@ impl Default for Config {
             font_size: 14,
             font_ligatures: font_ligatures_default(),
             font_size_zoom_step_mul_100: 100,
+            graphics_mode: GraphicsMode::default(),
             font_stretch: Stretch::Normal.to_number(),
             font_weight: Weight::NORMAL.0,
             opacity: 100,

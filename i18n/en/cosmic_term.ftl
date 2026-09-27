@@ -63,6 +63,11 @@ show-pane-borders = Show pane borders
 
 ### Advanced
 advanced = Advanced
+graphics-mode = Graphics mode
+graphics-mode-description = Restart COSMIC Terminal to apply changes.
+graphics-mode-low-power = Low power GPU
+graphics-mode-high-performance = High performance GPU
+graphics-mode-software = Software (CPU)
 show-headerbar = Show header
 window-header = Window header
 show-header-description = Reveal the header from the right-click menu

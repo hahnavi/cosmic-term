@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 rust-version = "1.93"
 
 [dependencies]
-alacritty_terminal = "0.25.1"
+alacritty_terminal = { git = "https://github.com/hahnavi/alacritty", branch = "hahnavi" }
 hex_color = { version = "3", features = ["serde"] }
 indexmap = "2"
 log = "0.4"
@@ -42,7 +42,7 @@ features = ["monospace_fallback", "shape-run-cache"]
 
 [dependencies.libcosmic]
 git = "https://github.com/hahnavi/libcosmic.git"
-rev = "9244a75fb6d13657f869388b092cb1035b4c5615"
+branch = "hahnavi"
 default-features = false
 #TODO: a11y feature crashes file chooser dialog
 features = [
@@ -53,6 +53,7 @@ features = [
     "winit",
     "surface-message",
     "xdg-portal",
+    "tiny-skia",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -82,7 +83,7 @@ inherits = "release"
 debug = true
 strip = false
 
-# [patch.'https://github.com/pop-os/libcosmic']
+# [patch.'https://github.com/hahnavi/libcosmic']
 # libcosmic = { path = "../libcosmic" }
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
@@ -94,9 +95,8 @@ strip = false
 # iced_futures = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 # iced_winit = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 
-[patch."https://github.com/pop-os/libcosmic.git"]
-libcosmic = { git = "https://github.com/hahnavi/libcosmic.git", rev = "9244a75fb6d13657f869388b092cb1035b4c5615" }
+# [patch.'https://github.com/hahnavi/alacritty']
+# alacritty_terminal = { path = "../alacritty/alacritty_terminal" }
 
 [patch.crates-io]
-alacritty_terminal = { git = "https://github.com/hahnavi/alacritty", rev = "6e3dea49920b58bb634ad01b87e8ddb91ee8613f" }
 vte = { git = "https://github.com/hahnavi/vte", rev = "4b50eb09ef4c9791aa2e439e1b52ecf983f24aae" }
