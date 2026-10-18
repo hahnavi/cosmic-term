@@ -9,17 +9,17 @@ rust-version = "1.93"
 [dependencies]
 alacritty_terminal = { git = "https://github.com/hahnavi/alacritty", branch = "hahnavi" }
 hex_color = { version = "3", features = ["serde"] }
-indexmap = "2"
+indexmap = "2.14.2"
 log = "0.4"
 open = "5.3.2"
 paste = "1.0"
 regex = "1"
-ron = "0.11"
+ron = "0.12.2"
 serde = { version = "1", features = ["serde_derive"] }
-shlex = "1"
-tokio = { version = "1", features = ["sync"] }
+shlex = "2.0.1"
+tokio = { version = "1.53.3", features = ["sync"] }
 # CLI arguments
-clap_lex = "0.7"
+clap_lex = "1.1.1"
 # Internationalization
 i18n-embed = { version = "0.16", features = [
     "fluent-system",
@@ -37,7 +37,8 @@ thiserror = { version = "2.0", optional = true }
 secstr = { version = "0.5", optional = true }
 
 [dependencies.cosmic-text]
-version = "0.19"
+git = "https://github.com/hahnavi/cosmic-text.git"
+branch = "hahnavi"
 features = ["monospace_fallback", "shape-run-cache"]
 
 [dependencies.libcosmic]
@@ -57,7 +58,7 @@ features = [
 ]
 
 [target.'cfg(unix)'.dependencies]
-fork = "0.4"
+fork = "0.10.0"
 
 [build-dependencies]
 xdgen = "0.1"
@@ -83,6 +84,8 @@ inherits = "release"
 debug = true
 strip = false
 
+# Local development overrides.
+# Restore the git-based patches before committing a manifest or lockfile change.
 # [patch.'https://github.com/hahnavi/libcosmic']
 # libcosmic = { path = "../libcosmic" }
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
@@ -97,6 +100,9 @@ strip = false
 
 # [patch.'https://github.com/hahnavi/alacritty']
 # alacritty_terminal = { path = "../alacritty/alacritty_terminal" }
+
+# [patch.'https://github.com/hahnavi/cosmic-text.git']
+# cosmic-text = { path = "../cosmic-text" }
 
 [patch.crates-io]
 vte = { git = "https://github.com/hahnavi/vte", rev = "4b50eb09ef4c9791aa2e439e1b52ecf983f24aae" }

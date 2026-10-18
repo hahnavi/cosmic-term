@@ -117,7 +117,7 @@ pub fn color_scheme_menu<'a>(
     widget::container(column)
         .padding(1)
         //TODO: move style to libcosmic
-        .style(|theme| {
+        .style(|theme: &cosmic::Theme| {
             let cosmic = theme.cosmic();
             let component = &cosmic.background(theme.transparent).component;
             widget::container::Style {
@@ -204,6 +204,7 @@ pub fn menu_bar(
                     fl!("file"),
                     vec![
                         MenuItem::Button(fl!("new-tab"), None, Action::TabNew),
+                        MenuItem::Button(fl!("new-ssh-session"), None, Action::NewSshSession),
                         MenuItem::Button(fl!("new-window"), None, Action::WindowNew),
                         MenuItem::Divider,
                         MenuItem::Folder(fl!("profile"), profile_items),
@@ -235,6 +236,8 @@ pub fn menu_bar(
                         MenuItem::Divider,
                         MenuItem::Button(fl!("next-tab"), None, Action::TabNext),
                         MenuItem::Button(fl!("previous-tab"), None, Action::TabPrev),
+                        MenuItem::Divider,
+                        MenuItem::Button(fl!("toggle-sidebar"), None, Action::ToggleSidebar),
                         MenuItem::Divider,
                         MenuItem::Button(
                             fl!("split-horizontal"),

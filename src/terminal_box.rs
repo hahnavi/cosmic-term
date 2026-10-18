@@ -13,7 +13,6 @@ use cosmic::{
     iced::core::{
         Border, Shell,
         border::Radius,
-        clipboard::Clipboard,
         input_method::{self, InputMethod},
         keyboard::key::Named,
         layout::{self, Layout},
@@ -247,7 +246,7 @@ where
     fn input_method<'b>(
         &self,
         state: &'b State,
-        layout: Layout<'_>,
+        layout: Layout,
         terminal: &std::sync::MutexGuard<'_, Terminal>,
     ) -> InputMethod<&'b str> {
         if !state.is_focused {
@@ -322,12 +321,7 @@ where
         Size::new(Length::Fill, Length::Fill)
     }
 
-    fn layout(
-        &mut self,
-        _tree: &mut widget::Tree,
-        _renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut widget::Tree, _renderer: &Renderer, limits: &layout::Limits) {
         let limits = limits.width(Length::Fill).height(Length::Fill);
 
         let mut terminal = self.terminal.lock().unwrap();
@@ -341,7 +335,7 @@ where
         }
 
         // Calculate layout lines
-        terminal.with_buffer(|buffer| {
+        let size = terminal.with_buffer(|buffer| {
             let mut layout_lines = 0;
             for line in &buffer.lines {
                 if let Some(layout) = line.layout_opt() {
@@ -352,14 +346,17 @@ where
             let height = layout_lines as f32 * buffer.metrics().line_height;
             let size = Size::new(limits.max().width, height);
 
-            layout::Node::new(limits.resolve(Length::Fill, Length::Fill, size))
-        })
+            limits.resolve(Length::Fill, Length::Fill, size)
+        });
+
+        tree.size = size;
     }
 
     fn operate(
         &mut self,
         tree: &mut widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        _viewport: &Rectangle,
         _renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
@@ -371,7 +368,7 @@ where
     fn mouse_interaction(
         &self,
         tree: &widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
@@ -416,7 +413,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -441,12 +438,13 @@ where
         } else {
             corner_radius.into()
         };
+        // Overlay the scrollbar so new scrollback does not resize the terminal
+        // grid or reflow its contents.
         let scrollbar_w = f32::from(cosmic_theme.spacing.space_xxs);
 
         let view_position = layout.position() + [self.padding.left, self.padding.top].into();
-        let view_w = cmp::min(viewport.width as i32, layout.bounds().width as i32)
-            - self.padding.x() as i32
-            - scrollbar_w as i32;
+        let view_w =
+            cmp::min(viewport.width as i32, layout.bounds().width as i32) - self.padding.x() as i32;
         let view_h = cmp::min(viewport.height as i32, layout.bounds().height as i32)
             - self.padding.y() as i32;
 
@@ -791,72 +789,82 @@ where
         if let Some((start, end)) = terminal.scrollbar() {
             let scrollbar_y = start * view_h as f32;
             let scrollbar_h = end * view_h as f32 - scrollbar_y;
-            let scrollbar_rect = Rectangle::new(
-                [view_w as f32, scrollbar_y].into(),
-                Size::new(scrollbar_w, scrollbar_h),
-            );
+            let terminal_size = terminal.size();
+            let grid_right = terminal_size.columns() as f32 * terminal_size.cell_width;
+            let available_width = (view_w as f32 - grid_right).max(0.0);
+            let scrollbar_width = scrollbar_w.min(available_width);
 
-            let pressed = matches!(&state.dragging, Some(Dragging::Scrollbar { .. }));
+            if scrollbar_width > 0.0 {
+                let scrollbar_rect = Rectangle::new(
+                    [view_w as f32 - scrollbar_width, scrollbar_y].into(),
+                    Size::new(scrollbar_width, scrollbar_h),
+                );
 
-            let mut hover = false;
-            if let Some(p) = cursor_position.position_in(layout.bounds()) {
-                let x = p.x - self.padding.left;
-                if x >= scrollbar_rect.x && x < (scrollbar_rect.x + scrollbar_rect.width) {
-                    hover = true;
+                let pressed = matches!(&state.dragging, Some(Dragging::Scrollbar { .. }));
+
+                let mut hover = false;
+                if let Some(p) = cursor_position.position_in(layout.bounds()) {
+                    let x = p.x - self.padding.left;
+                    if x >= scrollbar_rect.x && x < (scrollbar_rect.x + scrollbar_rect.width) {
+                        hover = true;
+                    }
                 }
-            }
 
-            let mut scrollbar_draw = scrollbar_rect + Vector::new(view_position.x, view_position.y);
-            if !hover && !pressed {
-                // Decrease draw width and keep centered when not hovered or pressed
-                scrollbar_draw.width /= 2.0;
-                scrollbar_draw.x += scrollbar_draw.width / 2.0;
-            }
+                let mut scrollbar_draw =
+                    scrollbar_rect + Vector::new(view_position.x, view_position.y);
+                if !hover && !pressed {
+                    // Decrease draw width and keep centered when not hovered or pressed
+                    scrollbar_draw.width /= 2.0;
+                    scrollbar_draw.x += scrollbar_draw.width / 2.0;
+                }
 
-            // neutral_6, 0.7
-            let base_color = cosmic_theme
-                .palette
-                .neutral_6
-                .without_alpha()
-                .with_alpha(0.7);
-            let scrollbar_color: Color = if pressed {
-                // pressed_state_color, 0.5
-                cosmic_theme
-                    .background(theme.transparent)
-                    .component
-                    .pressed
+                // neutral_6, 0.7
+                let base_color = cosmic_theme
+                    .palette
+                    .neutral_6
                     .without_alpha()
-                    .with_alpha(0.5)
-                    .over(base_color)
-                    .into()
-            } else if hover {
-                // hover_state_color, 0.2
-                cosmic_theme
-                    .background(theme.transparent)
-                    .component
-                    .hover
-                    .without_alpha()
-                    .with_alpha(0.2)
-                    .over(base_color)
-                    .into()
-            } else {
-                base_color.into()
-            };
+                    .with_alpha(0.7);
+                let scrollbar_color: Color = if pressed {
+                    // pressed_state_color, 0.5
+                    cosmic_theme
+                        .background(theme.transparent)
+                        .component
+                        .pressed
+                        .without_alpha()
+                        .with_alpha(0.5)
+                        .over(base_color)
+                        .into()
+                } else if hover {
+                    // hover_state_color, 0.2
+                    cosmic_theme
+                        .background(theme.transparent)
+                        .component
+                        .hover
+                        .without_alpha()
+                        .with_alpha(0.2)
+                        .over(base_color)
+                        .into()
+                } else {
+                    base_color.into()
+                };
 
-            renderer.fill_quad(
-                Quad {
-                    bounds: scrollbar_draw,
-                    border: Border {
-                        radius: (scrollbar_draw.width / 2.0).into(),
-                        width: 0.0,
-                        color: Color::TRANSPARENT,
+                renderer.fill_quad(
+                    Quad {
+                        bounds: scrollbar_draw,
+                        border: Border {
+                            radius: (scrollbar_draw.width / 2.0).into(),
+                            width: 0.0,
+                            color: Color::TRANSPARENT,
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-                scrollbar_color,
-            );
+                    scrollbar_color,
+                );
 
-            state.scrollbar_rect.set(scrollbar_rect);
+                state.scrollbar_rect.set(scrollbar_rect);
+            } else {
+                state.scrollbar_rect.set(Rectangle::default());
+            }
         } else {
             state.scrollbar_rect.set(Rectangle::default())
         }
@@ -947,10 +955,9 @@ where
         &mut self,
         tree: &mut widget::Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor_position: mouse::Cursor,
         _renderer: &Renderer,
-        _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle<f32>,
     ) {

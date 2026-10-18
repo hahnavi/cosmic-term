@@ -6,6 +6,7 @@ use cosmic::dialog::file_chooser;
 use cosmic::iced::clipboard::dnd::DndAction;
 use cosmic::iced::core::keyboard::key::Named;
 use cosmic::iced::keyboard::key::Physical;
+use cosmic::iced::runtime::clipboard;
 use cosmic::widget::menu::action::MenuAction;
 use cosmic::widget::menu::key_bind::KeyBind;
 use cosmic::widget::pane_grid::Pane;
@@ -18,7 +19,7 @@ use cosmic::{
     iced::{
         self, Alignment, Color, Event, Length, Limits, Padding, Subscription,
         advanced::graphics::text::font_system,
-        clipboard, event,
+        event,
         futures::SinkExt,
         keyboard::{Event as KeyEvent, Key, Modifiers},
         mouse::{Button as MouseButton, Event as MouseEvent},
@@ -41,13 +42,13 @@ use std::{
     path::PathBuf,
     process,
     rc::Rc,
-    sync::{Arc, LazyLock, Mutex, atomic::Ordering},
+    sync::{LazyLock, Mutex, atomic::Ordering},
 };
 use tokio::sync::mpsc;
 
 use config::{
     AppTheme, CONFIG_VERSION, ColorScheme, ColorSchemeId, ColorSchemeKind, Config, GraphicsMode,
-    Profile, ProfileId,
+    Profile, ProfileId, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SshSession, SshSessionId,
 };
 mod config;
 mod mouse_reporter;
@@ -87,6 +88,58 @@ static ICON_CACHE: LazyLock<Mutex<IconCache>> = LazyLock::new(|| Mutex::new(Icon
 pub fn icon_cache_get(name: &'static str, size: u16) -> widget::icon::Icon {
     let mut icon_cache = ICON_CACHE.lock().unwrap();
     icon_cache.get(name, size)
+}
+
+/// Text mime types accepted when reading from or writing to a clipboard selection.
+const TEXT_MIME_TYPES: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "UTF8_STRING",
+    "STRING",
+    "text/plain",
+    "TEXT",
+];
+
+/// Text sent to the primary selection.
+///
+/// The primary selection is only reachable through the MIME data API, so this
+/// type describes plain text as a set of supported MIME types.
+struct PrimaryText(String);
+
+impl iced::clipboard::mime::AsMimeTypes for PrimaryText {
+    fn available(&self) -> std::borrow::Cow<'static, [String]> {
+        TEXT_MIME_TYPES
+            .iter()
+            .map(|mime_type| String::from(*mime_type))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    fn as_bytes(&self, mime_type: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+        TEXT_MIME_TYPES
+            .contains(&mime_type)
+            .then(|| std::borrow::Cow::Owned(self.0.clone().into_bytes()))
+    }
+}
+
+impl iced::clipboard::mime::AllowedMimeTypes for PrimaryText {
+    fn allowed() -> std::borrow::Cow<'static, [String]> {
+        TEXT_MIME_TYPES
+            .iter()
+            .map(|mime_type| String::from(*mime_type))
+            .collect::<Vec<_>>()
+            .into()
+    }
+}
+
+impl TryFrom<(Vec<u8>, String)> for PrimaryText {
+    type Error = iced::clipboard::mime::Error;
+
+    fn try_from((data, _mime_type): (Vec<u8>, String)) -> Result<Self, Self::Error> {
+        String::from_utf8(data)
+            .map(Self)
+            .map_err(|_| iced::clipboard::mime::Error)
+    }
 }
 
 /// Runs application with these settings
@@ -199,38 +252,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     configure_graphics_mode(config.graphics_mode);
 
-    // Pre-spawn the PTY for the first terminal so the shell initializes while
-    // the app launches. This is done on a worker thread because computing the
-    // initial terminal size requires initializing the whole font system
-    // (~10ms); doing that here would delay connecting to the display server.
-    let startup_pty: Arc<Mutex<Option<StartupPty>>> = Arc::new(Mutex::new(None));
-    {
-        let profile = config
-            .default_profile
-            .and_then(|profile_id| config.profiles.get(&profile_id));
-        let (options, _) = resolve_terminal_options(
-            startup_options.clone().unwrap_or_default(),
-            profile,
-            None,
-        );
-        let thread_config = config.clone();
-        let slot = startup_pty.clone();
-        std::thread::Builder::new()
-            .name("terminal-pre-spawn".into())
-            .spawn(move || {
-                let size = terminal::startup_terminal_size(&thread_config);
-                let result = match tty::new(&options, size.into(), 0) {
-                    Ok(pty) => Some(StartupPty { pty, options, size }),
-                    Err(err) => {
-                        log::error!("failed to pre-spawn terminal: {}", err);
-                        None
-                    }
-                };
-                *slot.lock().unwrap() = result;
-            })
-            .expect("spawn terminal pre-spawn worker");
-    }
-
     // Set settings
     let mut settings = Settings::default();
     settings = settings.theme(config.app_theme.theme());
@@ -242,7 +263,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         config,
         shortcuts_config,
         startup_options,
-        startup_pty,
         term_config,
     };
 
@@ -288,7 +308,6 @@ pub struct Flags {
     config: Config,
     shortcuts_config: shortcuts::ShortcutsConfig,
     startup_options: Option<tty::Options>,
-    startup_pty: Arc<Mutex<Option<StartupPty>>>,
     term_config: term::Config,
 }
 
@@ -344,12 +363,6 @@ fn build_font_catalog() -> FontCatalog {
     }
 }
 
-struct StartupPty {
-    pty: tty::Pty,
-    options: tty::Options,
-    size: terminal::Size,
-}
-
 // Merge startup options with an optional profile into the options for a new terminal.
 fn resolve_terminal_options(
     startup_options: tty::Options,
@@ -388,6 +401,69 @@ fn resolve_terminal_options(
     (options, tab_title_override)
 }
 
+fn ssh_session_args(session: &SshSession) -> Vec<String> {
+    let mut args = Vec::new();
+    if session.port != 22 {
+        args.extend(["-p".to_string(), session.port.to_string()]);
+    }
+    if session.compression {
+        args.push("-C".to_string());
+    }
+    // Explicitly disable X11 forwarding, including when a host's SSH config
+    // enables it, since COSMIC Terminal does not offer X11 session support.
+    args.push("-x".to_string());
+    if session.send_locale {
+        args.extend([
+            "-o".to_string(),
+            "SendEnv=LANG".to_string(),
+            "-o".to_string(),
+            "SendEnv=LC_*".to_string(),
+        ]);
+    }
+    if !session.identity_file.trim().is_empty() {
+        args.extend(["-i".to_string(), session.identity_file.trim().to_string()]);
+    }
+    if !session.jump_host.trim().is_empty() {
+        args.extend(["-J".to_string(), session.jump_host.trim().to_string()]);
+    }
+    let command = session.command.trim();
+    if !command.is_empty() && session.keep_open {
+        args.push("-t".to_string());
+    }
+    let destination = if session.username.is_empty() {
+        session.host.clone()
+    } else {
+        format!("{}@{}", session.username, session.host)
+    };
+    args.push(destination);
+
+    if !command.is_empty() {
+        let mut command = command.to_string();
+        if session.keep_open {
+            // A remote command normally closes the SSH connection when it
+            // finishes. Keep the terminal useful by starting a login shell
+            // afterward.
+            command.push_str("\nexec \"${SHELL:-/bin/sh}\" -l");
+        }
+        args.push(command);
+    }
+
+    args
+}
+
+fn ssh_session_options(session: &SshSession) -> tty::Options {
+    // SSH tabs inherit the application process environment. Their local
+    // working directory and profile-specific drain behavior are deliberately
+    // left at tty defaults; neither is part of a saved remote-session record.
+    tty::Options {
+        shell: Some(tty::Shell::new(
+            "ssh".to_string(),
+            ssh_session_args(session),
+        )),
+        ..tty::Options::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     About,
@@ -400,6 +476,7 @@ pub enum Action {
     Find,
     KeyboardShortcuts,
     LaunchUrlByMenu,
+    NewSshSession,
     PaneFocusDown,
     PaneFocusLeft,
     PaneFocusRight,
@@ -431,6 +508,7 @@ pub enum Action {
     TabNext,
     TabPrev,
     ToggleFullscreen,
+    ToggleSidebar,
     WindowClose,
     WindowNew,
     ZoomIn,
@@ -453,6 +531,7 @@ impl Action {
             Self::Find => Message::Find(true),
             Self::KeyboardShortcuts => Message::ToggleContextPage(ContextPage::KeyboardShortcuts),
             Self::LaunchUrlByMenu => Message::LaunchUrlByMenu,
+            Self::NewSshSession => Message::SshSessionNew,
             Self::PaneFocusDown => Message::PaneFocusAdjacent(pane_grid::Direction::Down),
             Self::PaneFocusLeft => Message::PaneFocusAdjacent(pane_grid::Direction::Left),
             Self::PaneFocusRight => Message::PaneFocusAdjacent(pane_grid::Direction::Right),
@@ -484,6 +563,7 @@ impl Action {
             Self::TabNext => Message::TabNext,
             Self::TabPrev => Message::TabPrev,
             Self::ToggleFullscreen => Message::ToggleFullscreen,
+            Self::ToggleSidebar => Message::ToggleSidebar,
             Self::WindowClose => Message::WindowClose,
             Self::WindowNew => Message::WindowNew,
             Self::ZoomIn => Message::ZoomIn,
@@ -590,6 +670,30 @@ pub enum Message {
     ProfileTabTitle(ProfileId, String),
     ReorderTab(Pane, ReorderEvent),
     ScrollbackLines(u32),
+    SshSessionCancel,
+    SshSessionConnect(SshSessionId),
+    SshSessionContextAction(SshSessionContextAction),
+    SshSessionDeleteCancel,
+    SshSessionDeleteConfirm,
+    SshSessionEdit(SshSessionId),
+    SshSessionManagerDismiss,
+    SshSessionsExport,
+    SshSessionsExportResult(FileChooserOutcome<PathBuf>),
+    SshSessionsImport,
+    SshSessionsImportResult(FileChooserOutcome<Vec<PathBuf>>),
+    SshSessionCommand(String),
+    SshSessionHost(String),
+    SshSessionIdentityFile(String),
+    SshSessionJumpHost(String),
+    SshSessionName(String),
+    SshSessionNew,
+    SshSessionPort(String),
+    SshSessionRemove(SshSessionId),
+    SshSessionSave,
+    SshSessionUsername(String),
+    SshSessionCompression(bool),
+    SshSessionKeepOpen(bool),
+    SshSessionSendLocale(bool),
     Surface(surface::Action<Message>),
     SelectAll(Option<segmented_button::Entity>),
     ShowAdvancedFontSettings(bool),
@@ -607,9 +711,11 @@ pub enum Message {
     TabNewNoProfile,
     TabNext,
     TabPrev,
+    TerminalSpawnRetry(pane_grid::Pane, segmented_button::Entity),
     TermEvent(pane_grid::Pane, segmented_button::Entity, TermEvent),
     TermEventTx(mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, TermEvent)>),
     ToggleFullscreen,
+    ToggleSidebar,
     ToggleContextPage(ContextPage),
     UpdateDefaultProfile((bool, ProfileId)),
     UseBrightBold(bool),
@@ -618,9 +724,171 @@ pub enum Message {
     WindowNew,
     WindowFocused,
     WindowUnfocused,
+    LocalShell,
     ZoomIn,
     ZoomOut,
     ZoomReset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionNavEntry {
+    LocalShell,
+    Ssh(SshSessionId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshSessionContextAction {
+    New,
+    Connect(SshSessionId),
+    Edit(SshSessionId),
+    Remove(SshSessionId),
+    Import,
+    Export,
+}
+
+impl MenuAction for SshSessionContextAction {
+    type Message = cosmic::Action<Message>;
+
+    fn message(&self) -> Self::Message {
+        cosmic::Action::App(Message::SshSessionContextAction(*self))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SshSessionEditor {
+    id: Option<SshSessionId>,
+    name: String,
+    host: String,
+    username: String,
+    port: String,
+    identity_file: String,
+    jump_host: String,
+    command: String,
+    compression: bool,
+    send_locale: bool,
+    keep_open: bool,
+    error: Option<String>,
+}
+
+impl SshSessionEditor {
+    fn new() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            host: String::new(),
+            username: String::new(),
+            port: "22".to_string(),
+            identity_file: String::new(),
+            jump_host: String::new(),
+            command: String::new(),
+            compression: false,
+            send_locale: false,
+            keep_open: false,
+            error: None,
+        }
+    }
+
+    fn from_session(id: SshSessionId, session: &SshSession) -> Self {
+        Self {
+            id: Some(id),
+            name: session.name.clone(),
+            host: session.host.clone(),
+            username: session.username.clone(),
+            port: session.port.to_string(),
+            identity_file: session.identity_file.clone(),
+            jump_host: session.jump_host.clone(),
+            command: session.command.clone(),
+            compression: session.compression,
+            send_locale: session.send_locale,
+            keep_open: session.keep_open,
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SshSessionValidationError {
+    HostRequired,
+    HostInvalid,
+    UsernameInvalid,
+    JumpHostInvalid,
+    PortInvalid,
+}
+
+fn validate_ssh_session(
+    editor: &SshSessionEditor,
+) -> Result<SshSession, SshSessionValidationError> {
+    let host = editor.host.trim();
+    if host.is_empty() {
+        return Err(SshSessionValidationError::HostRequired);
+    }
+    if host.starts_with('-') || host.contains('@') || host.chars().any(char::is_whitespace) {
+        return Err(SshSessionValidationError::HostInvalid);
+    }
+
+    let username = editor.username.trim();
+    if username.starts_with('-')
+        || username.contains('@')
+        || username.chars().any(char::is_whitespace)
+    {
+        return Err(SshSessionValidationError::UsernameInvalid);
+    }
+
+    let jump_host = editor.jump_host.trim();
+    if jump_host.starts_with('-')
+        || jump_host.contains(',')
+        || jump_host.chars().any(char::is_whitespace)
+    {
+        return Err(SshSessionValidationError::JumpHostInvalid);
+    }
+
+    let port = if editor.port.trim().is_empty() {
+        22
+    } else {
+        match editor.port.trim().parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => return Err(SshSessionValidationError::PortInvalid),
+        }
+    };
+
+    Ok(SshSession {
+        name: if editor.name.trim().is_empty() {
+            host.to_string()
+        } else {
+            editor.name.trim().to_string()
+        },
+        host: host.to_string(),
+        username: username.to_string(),
+        port,
+        identity_file: editor.identity_file.trim().to_string(),
+        jump_host: jump_host.to_string(),
+        command: editor.command.trim().to_string(),
+        compression: editor.compression,
+        send_locale: editor.send_locale,
+        keep_open: editor.keep_open,
+    })
+}
+
+fn next_ssh_session_id(sessions: &BTreeMap<SshSessionId, SshSession>) -> Option<SshSessionId> {
+    let mut candidate = 0u64;
+    for id in sessions.keys() {
+        if id.0 == candidate {
+            candidate = candidate.checked_add(1)?;
+        } else if id.0 > candidate {
+            break;
+        }
+    }
+    Some(SshSessionId(candidate))
+}
+
+fn parse_ssh_sessions(source: &str) -> Result<Vec<SshSession>, String> {
+    match ron::from_str::<Vec<SshSession>>(source) {
+        Ok(sessions) => Ok(sessions),
+        Err(list_error) => match ron::from_str::<BTreeMap<SshSessionId, SshSession>>(source) {
+            Ok(sessions) => Ok(sessions.into_values().collect()),
+            Err(map_error) => Err(format!("{list_error}; {map_error}")),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -659,6 +927,12 @@ pub struct App {
     core: Core,
     about: About,
     pane_model: TerminalPaneGrid,
+    session_nav_model: segmented_button::SingleSelectModel,
+    ssh_session_editor: Option<SshSessionEditor>,
+    ssh_session_name_id: widget::Id,
+    ssh_session_delete_pending: Option<SshSessionId>,
+    ssh_session_delete_error: Option<String>,
+    ssh_session_manager_notice: Option<String>,
     config_handler: Option<cosmic_config::Config>,
     config: Config,
     shortcuts_config: shortcuts::ShortcutsConfig,
@@ -690,7 +964,6 @@ pub struct App {
     term_event_tx_opt:
         Option<mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, TermEvent)>>,
     startup_options: Option<tty::Options>,
-    startup_pty: Arc<Mutex<Option<StartupPty>>>,
     term_config: term::Config,
     file_chooser_pending: bool,
     color_scheme_errors: Vec<String>,
@@ -713,6 +986,64 @@ pub struct App {
 }
 
 impl App {
+    fn build_session_nav_model(
+        config: &Config,
+        active: Option<SessionNavEntry>,
+    ) -> segmented_button::SingleSelectModel {
+        let mut model = segmented_button::ModelBuilder::<segmented_button::SingleSelect>::default()
+            .insert(|builder| {
+                builder
+                    .text(fl!("local-shell"))
+                    .icon(widget::icon::from_name("utilities-terminal-symbolic").size(16))
+                    .data(SessionNavEntry::LocalShell)
+                    .activate()
+            });
+
+        for (index, (id, session)) in config.ssh_sessions.iter().enumerate() {
+            model = model.insert(|builder| {
+                let builder = builder
+                    .text(session.name.clone())
+                    .icon(widget::icon::from_name("network-server-symbolic").size(16))
+                    .data(SessionNavEntry::Ssh(*id));
+
+                if index == 0 {
+                    builder.divider_above()
+                } else {
+                    builder
+                }
+            });
+        }
+
+        let mut model = model.build();
+        let active_entity = active.and_then(|active| {
+            model
+                .iter()
+                .find(|entity| model.data::<SessionNavEntry>(*entity) == Some(&active))
+        });
+        if let Some(entity) = active_entity {
+            model.activate(entity);
+        }
+        model
+    }
+
+    fn rebuild_session_nav_model(&mut self) {
+        let previous = self
+            .session_nav_model
+            .data::<SessionNavEntry>(self.session_nav_model.active())
+            .copied()
+            .unwrap_or(SessionNavEntry::LocalShell);
+        self.session_nav_model = Self::build_session_nav_model(&self.config, Some(previous));
+    }
+
+    fn save_ssh_sessions(&self) -> Result<(), String> {
+        let Some(config_handler) = &self.config_handler else {
+            return Err("no configuration handler is available".to_string());
+        };
+        config_handler
+            .set("ssh_sessions", &self.config.ssh_sessions)
+            .map_err(|err| err.to_string())
+    }
+
     fn theme_names(&self, color_scheme_kind: ColorSchemeKind) -> &Vec<String> {
         match color_scheme_kind {
             ColorSchemeKind::Dark => &self.theme_names_dark,
@@ -1192,7 +1523,7 @@ impl App {
         sections.push(section.into());
 
         sections.push(
-            widget::row::with_children(vec![
+            widget::row::with_children::<Element<'_, Message>>(vec![
                 widget::space::horizontal().into(),
                 widget::button::standard(fl!("import"))
                     .on_press_maybe(
@@ -1206,7 +1537,7 @@ impl App {
 
         for error in &self.color_scheme_errors {
             sections.push(
-                widget::row::with_children(vec![
+                widget::row::with_children::<Element<'_, Message>>(vec![
                     icon_cache_get("dialog-error-symbolic", 16)
                         .class(style::Svg::Custom(Rc::new(|theme| {
                             let cosmic = theme.cosmic();
@@ -1274,7 +1605,7 @@ impl App {
 
                 let (bindings, changed) = self.shortcuts_config.bindings_for_action(action);
 
-                let mut buttons = widget::row::with_capacity(2);
+                let mut buttons: widget::Row<Element<'_, Message>> = widget::row::with_capacity(2);
                 if changed {
                     buttons = buttons.push(widget::tooltip(
                         widget::button::custom(icon_cache_get("edit-undo-symbolic", 16))
@@ -1376,7 +1707,7 @@ impl App {
 
                 profiles_section = profiles_section.add(
                     widget::settings::item::builder(profile_name).control(
-                        widget::row::with_children(vec![
+                        widget::row::with_children::<Element<'_, Message>>(vec![
                             widget::button::custom(icon_cache_get("edit-delete-symbolic", 16))
                                 .on_press(Message::ProfileRemove(profile_id))
                                 .class(style::Button::Icon)
@@ -1408,8 +1739,8 @@ impl App {
 
                     let expanded_section = widget::settings::section()
                         .add(
-                            widget::column::with_children(vec![
-                                widget::column::with_children(vec![
+                            widget::column::with_children::<Element<'_, Message>>(vec![
+                                widget::column::with_children::<Element<'_, Message>>(vec![
                                     widget::text(fl!("name")).into(),
                                     widget::text_input("", &profile.name)
                                         .on_input(move |text| {
@@ -1422,7 +1753,7 @@ impl App {
                                 ])
                                 .spacing(space_xxxs)
                                 .into(),
-                                widget::column::with_children(vec![
+                                widget::column::with_children::<Element<'_, Message>>(vec![
                                     widget::text(fl!("command-line")).into(),
                                     widget::text_input("", &profile.command)
                                         .on_input(move |text| {
@@ -1435,7 +1766,7 @@ impl App {
                                 ])
                                 .spacing(space_xxxs)
                                 .into(),
-                                widget::column::with_children(vec![
+                                widget::column::with_children::<Element<'_, Message>>(vec![
                                     widget::text(fl!("working-directory")).into(),
                                     widget::text_input("", &profile.working_directory)
                                         .on_input(move |text| {
@@ -1448,7 +1779,7 @@ impl App {
                                 ])
                                 .spacing(space_xxxs)
                                 .into(),
-                                widget::column::with_children(vec![
+                                widget::column::with_children::<Element<'_, Message>>(vec![
                                     widget::text(fl!("tab-title")).into(),
                                     widget::text_input("", &profile.tab_title)
                                         .on_input(move |text| {
@@ -1510,8 +1841,8 @@ impl App {
                             ),
                         )
                         .add(
-                            widget::row::with_children(vec![
-                                widget::column::with_children(vec![
+                            widget::row::with_children::<Element<'_, Message>>(vec![
+                                widget::column::with_children::<Element<'_, Message>>(vec![
                                     widget::text(fl!("hold")).into(),
                                     widget::text::caption(fl!("remain-open")).into(),
                                 ])
@@ -1532,14 +1863,14 @@ impl App {
                         left: space_s.into(),
                         right: space_s.into(),
                     };
-                    profiles_section =
-                        profiles_section.add(widget::container(expanded_section).padding(padding))
+                    profiles_section = profiles_section
+                        .add(widget::container(Element::from(expanded_section)).padding(padding))
                 }
             }
             sections.push(profiles_section.into());
         }
 
-        let add_profile = widget::row::with_children(vec![
+        let add_profile = widget::row::with_children::<Element<'_, Message>>(vec![
             widget::space::horizontal().into(),
             widget::button::standard(fl!("add-profile"))
                 .on_press(Message::ProfileNew)
@@ -1724,7 +2055,7 @@ impl App {
                 left: 12.0,
                 right: 12.0,
             };
-            widget::container(section).padding(padding)
+            Element::from(widget::container(Element::from(section)).padding(padding))
         };
 
         if self.show_advanced_font_settings {
@@ -1815,6 +2146,21 @@ impl App {
         profile_id_opt: Option<ProfileId>,
         inherit_working_directory: bool,
     ) -> Task<Message> {
+        self.create_and_focus_new_terminal_with_options(
+            pane,
+            profile_id_opt,
+            inherit_working_directory,
+            None,
+        )
+    }
+
+    fn create_and_focus_new_terminal_with_options(
+        &mut self,
+        pane: pane_grid::Pane,
+        profile_id_opt: Option<ProfileId>,
+        inherit_working_directory: bool,
+        options_override: Option<(tty::Options, Option<String>, Option<SshSessionId>)>,
+    ) -> Task<Message> {
         let inherited_working_directory = inherit_working_directory
             .then(|| self.active_terminal_working_directory())
             .flatten();
@@ -1838,25 +2184,23 @@ impl App {
                     Some(colors) => {
                         let current_pane = self.pane_model.focused();
                         if let Some(tab_model) = self.pane_model.active_mut() {
-                            let (options, tab_title_override) = {
-                                let profile = profile_id_opt
-                                    .and_then(|profile_id| self.config.profiles.get(&profile_id));
-                                // Merge profile and startup options, preferring startup options
-                                let startup_options =
-                                    self.startup_options.take().unwrap_or_default();
-                                resolve_terminal_options(
-                                    startup_options,
-                                    profile,
-                                    inherited_working_directory.as_ref(),
-                                )
-                            };
-
-                            let startup_pty = self
-                                .startup_pty
-                                .lock()
-                                .unwrap()
-                                .take()
-                                .filter(|startup_pty| startup_pty.options == options);
+                            let (options, tab_title_override, ssh_session_id_opt) =
+                                if let Some(options) = options_override {
+                                    options
+                                } else {
+                                    let profile = profile_id_opt.and_then(|profile_id| {
+                                        self.config.profiles.get(&profile_id)
+                                    });
+                                    // Merge profile and startup options, preferring startup options.
+                                    let startup_options =
+                                        self.startup_options.take().unwrap_or_default();
+                                    let (options, title) = resolve_terminal_options(
+                                        startup_options,
+                                        profile,
+                                        inherited_working_directory.as_ref(),
+                                    );
+                                    (options, title, None)
+                                };
 
                             let entity = tab_model
                                 .insert()
@@ -1865,61 +2209,28 @@ impl App {
                                         .clone()
                                         .unwrap_or_else(|| fl!("new-terminal")),
                                 )
-                                .icon(
-                                    widget::icon::from_name("utilities-terminal-symbolic").icon(),
-                                )
+                                .icon(widget::icon::from_name("utilities-terminal-symbolic").icon())
                                 .closable()
                                 .activate()
                                 .id();
-                            match Terminal::new(
+                            // The shell is spawned later, on the first layout of
+                            // the terminal box, directly at the real size.
+                            let mut terminal = Terminal::new(
                                 current_pane,
                                 entity,
                                 term_event_tx.clone(),
                                 self.term_config.clone(),
                                 options,
-                                startup_pty.map(|startup_pty| (startup_pty.pty, startup_pty.size)),
                                 &self.config,
                                 *colors,
                                 profile_id_opt,
                                 tab_title_override,
-                            ) {
-                                Ok(mut terminal) => {
-                                    terminal.set_config(
-                                        &self.config,
-                                        color_scheme_kind,
-                                        &self.themes,
-                                    );
-                                    tab_model
-                                        .data_set::<Mutex<Terminal>>(entity, Mutex::new(terminal));
-                                }
-                                Err(err) if profile_id_opt.is_some() => {
-                                    // Create a tab without a profile if the selected
-                                    // profile doesn't work
-                                    let name = profile_id_opt
-                                        .and_then(|id| self.config.profiles.get(&id))
-                                        .map(|profile| profile.name.as_str())
-                                        .unwrap_or_default();
-                                    log::error!(
-                                        "failed to open terminal with profile `{}`: {}",
-                                        name,
-                                        err
-                                    );
-
-                                    // TabClose focuses the nearest tab which would be incorrect
-                                    // in this specific case as it would unfocus the new tab
-                                    // created by TabNewNoProfile
-                                    // TabClose can also cause the terminal app to close if it
-                                    // closes the only open tab. This would close cosmic term
-                                    // if launched with an invalid profile (issue #274)
-                                    tab_model.remove(entity);
-                                    return self.update(Message::TabNewNoProfile);
-                                }
-                                Err(err) => {
-                                    log::error!("failed to open terminal: {}", err);
-                                    // Clean up partially created tab
-                                    return self.update(Message::TabClose(Some(entity)));
-                                }
+                            );
+                            if let Some(ssh_session_id) = ssh_session_id_opt {
+                                terminal.set_ssh_session_id(ssh_session_id);
                             }
+                            terminal.set_config(&self.config, color_scheme_kind, &self.themes);
+                            tab_model.data_set::<Mutex<Terminal>>(entity, Mutex::new(terminal));
                         } else {
                             log::error!("Found no active pane");
                         }
@@ -1963,10 +2274,154 @@ impl Application for App {
         &mut self.core
     }
 
+    fn nav_model(&self) -> Option<&widget::nav_bar::Model> {
+        Some(&self.session_nav_model)
+    }
+
+    fn nav_bar(&self) -> Option<Element<'_, action::Action<Self::Message>>> {
+        if !self.core().nav_bar_active() {
+            return None;
+        }
+
+        let nav_model = self.nav_model()?;
+        let nav = widget::nav_bar(nav_model, |id| {
+            action::Action::Cosmic(cosmic::app::Action::NavBar(id))
+        })
+        .on_context(|id| action::Action::Cosmic(cosmic::app::Action::NavBarContext(id)))
+        .context_menu(self.nav_context_menu());
+
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        let nav = nav
+            .window_id_maybe(self.core().main_window_id())
+            .on_surface_action(|surface_action| action::Action::Surface(surface_action.flatten()));
+
+        // The session sidebar is resizable, so fill the width it is given;
+        // in condensed mode it shrinks to its contents, as before.
+        let nav = nav
+            .into_container()
+            .height(Length::Fill)
+            .width(if self.core().is_condensed() {
+                Length::Shrink
+            } else {
+                Length::Fill
+            });
+
+        Some(nav.into())
+    }
+
+    fn nav_bar_width(&self) -> Option<f32> {
+        Some(
+            self.config
+                .sidebar_width
+                .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH) as f32,
+        )
+    }
+
+    fn on_nav_bar_resize(&mut self, width: f32) -> Task<Self::Message> {
+        self.config.sidebar_width =
+            (width.round() as u32).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        Task::none()
+    }
+
+    fn on_nav_bar_resize_end(&mut self) -> Task<Self::Message> {
+        if let Some(config_handler) = &self.config_handler {
+            let sidebar_width = self.config.sidebar_width;
+            if let Err(err) = config_handler.set("sidebar_width", &sidebar_width) {
+                log::warn!("failed to save config sidebar_width: {}", err);
+            }
+        }
+        Task::none()
+    }
+
+    fn on_nav_bar_toggle(&mut self) -> Task<Self::Message> {
+        self.update_focus()
+    }
+
+    fn nav_context_menu(&self) -> Option<Vec<widget::menu::Tree<cosmic::Action<Self::Message>>>> {
+        use widget::menu::Item as MenuItem;
+
+        let menus = self
+            .session_nav_model
+            .iter()
+            .map(
+                |entity| match self.session_nav_model.data::<SessionNavEntry>(entity) {
+                    Some(SessionNavEntry::LocalShell) => vec![
+                        MenuItem::Button(
+                            fl!("new-ssh-session"),
+                            None,
+                            SshSessionContextAction::New,
+                        ),
+                        MenuItem::Button(
+                            fl!("import-ssh-sessions"),
+                            None,
+                            SshSessionContextAction::Import,
+                        ),
+                        MenuItem::Button(
+                            fl!("export-ssh-sessions"),
+                            None,
+                            SshSessionContextAction::Export,
+                        ),
+                    ],
+                    Some(SessionNavEntry::Ssh(session_id)) => vec![
+                        MenuItem::Button(
+                            fl!("connect-ssh-session"),
+                            None,
+                            SshSessionContextAction::Connect(*session_id),
+                        ),
+                        MenuItem::Button(
+                            fl!("edit-session"),
+                            None,
+                            SshSessionContextAction::Edit(*session_id),
+                        ),
+                        MenuItem::Button(
+                            fl!("delete-session"),
+                            None,
+                            SshSessionContextAction::Remove(*session_id),
+                        ),
+                        MenuItem::Divider,
+                        MenuItem::Button(
+                            fl!("new-ssh-session"),
+                            None,
+                            SshSessionContextAction::New,
+                        ),
+                        MenuItem::Button(
+                            fl!("import-ssh-sessions"),
+                            None,
+                            SshSessionContextAction::Import,
+                        ),
+                        MenuItem::Button(
+                            fl!("export-ssh-sessions"),
+                            None,
+                            SshSessionContextAction::Export,
+                        ),
+                    ],
+                    None => Vec::new(),
+                },
+            )
+            .collect();
+
+        Some(widget::menu::nav_context(&HashMap::new(), menus))
+    }
+
+    fn on_nav_select(&mut self, id: widget::nav_bar::Id) -> Task<Self::Message> {
+        match self.session_nav_model.data::<SessionNavEntry>(id).copied() {
+            Some(SessionNavEntry::LocalShell) => {
+                self.session_nav_model.activate(id);
+                self.update(Message::LocalShell)
+            }
+            Some(SessionNavEntry::Ssh(session_id)) => {
+                self.session_nav_model.activate(id);
+                self.update(Message::SshSessionConnect(session_id))
+            }
+            None => Task::none(),
+        }
+    }
+
     /// Creates the application, and optionally emits command on initialize.
     fn init(mut core: Core, flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        core.window.content_container = false;
+        core.nav_bar_set_toggled(false);
         core.window.show_headerbar = flags.config.show_headerbar;
+        core.window.content_container = false;
 
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
         let graphics_mode_names = vec![
@@ -2050,10 +2505,17 @@ impl Application for App {
             ]);
 
         let key_binds = key_binds(&flags.shortcuts_config);
+        let session_nav_model = Self::build_session_nav_model(&flags.config, None);
         let mut app = Self {
             core,
             about,
             pane_model,
+            session_nav_model,
+            ssh_session_editor: None,
+            ssh_session_name_id: widget::Id::unique(),
+            ssh_session_delete_pending: None,
+            ssh_session_delete_error: None,
+            ssh_session_manager_notice: None,
             config_handler: flags.config_handler,
             config: flags.config,
             shortcuts_config: flags.shortcuts_config,
@@ -2083,7 +2545,6 @@ impl Application for App {
             find_search_id: widget::Id::unique(),
             find_search_value: String::new(),
             startup_options: flags.startup_options,
-            startup_pty: flags.startup_pty,
             term_config: flags.term_config,
             term_event_tx_opt: None,
             file_chooser_pending: false,
@@ -2113,6 +2574,14 @@ impl Application for App {
 
     //TODO: currently the first escape unfocuses, and the second calls this function
     fn on_escape(&mut self) -> Task<Message> {
+        if self.ssh_session_editor.take().is_some() {
+            return self.update_focus();
+        }
+        if self.ssh_session_delete_pending.take().is_some() {
+            self.ssh_session_delete_error = None;
+            return self.update_focus();
+        }
+
         if self.core.window.show_context {
             // Handle keyboard shortcut page escape
             if let ContextPage::KeyboardShortcuts = self.context_page {
@@ -2484,10 +2953,14 @@ impl Application for App {
                     let font_name_changed = config.font_name != self.config.font_name;
                     let scrollback_changed =
                         config.scrollback_lines != self.config.scrollback_lines;
+                    let ssh_sessions_changed = config.ssh_sessions != self.config.ssh_sessions;
                     log::info!("update config");
                     //TODO: update syntax theme by clearing tabs, only if needed
                     self.config = *config;
                     self.menu_revision = self.menu_revision.wrapping_add(1);
+                    if ssh_sessions_changed {
+                        self.rebuild_session_nav_model();
+                    }
                     if shortcuts_changed {
                         self.shortcuts_config =
                             shortcuts::ShortcutsConfig::new(self.config.shortcuts_custom.clone());
@@ -2511,7 +2984,10 @@ impl Application for App {
                         let terminal = terminal.lock().unwrap();
                         let term = terminal.term.lock();
                         if let Some(text) = term.selection_to_string() {
-                            return Task::batch([clipboard::write(text), self.update_focus()]);
+                            return Task::batch([
+                                clipboard::write(text).map(|_| action::none()),
+                                self.update_focus(),
+                            ]);
                         }
                     }
                 } else {
@@ -2532,7 +3008,10 @@ impl Application for App {
                             // Mark as dirty
                             terminal.needs_update = true;
                             drop(terminal);
-                            return Task::batch([clipboard::write(text), self.update_focus()]);
+                            return Task::batch([
+                                clipboard::write(text).map(|_| action::none()),
+                                self.update_focus(),
+                            ]);
                         } else {
                             // Drop the lock for term so that input_scroll doesn't block forever
                             drop(term);
@@ -2550,6 +3029,10 @@ impl Application for App {
                     return cosmic::command::toggle_maximize(window_id);
                 }
             }
+            Message::ToggleSidebar => {
+                self.core.nav_bar_toggle();
+                return self.on_nav_bar_toggle();
+            }
             Message::CopyPrimary(entity_opt) => {
                 if let Some(tab_model) = self.pane_model.active() {
                     let entity = entity_opt.unwrap_or_else(|| tab_model.active());
@@ -2558,7 +3041,9 @@ impl Application for App {
                         let term = terminal.term.lock();
                         if let Some(text) = term.selection_to_string() {
                             return Task::batch([
-                                clipboard::write_primary(text),
+                                clipboard::write_primary_data::<cosmic::Action<Message>>(
+                                    PrimaryText(text),
+                                ),
                                 self.update_focus(),
                             ]);
                         }
@@ -2713,9 +3198,11 @@ impl Application for App {
                 self.pane_model.set_focus(pane);
                 return Task::batch([
                     self.update_focus(),
-                    clipboard::read_primary().map(move |value_opt| match value_opt {
-                        Some(value) => action::app(Message::PasteValue(entity_opt, value)),
-                        None => action::none(),
+                    clipboard::read_primary_data::<PrimaryText>().map(move |value_opt| {
+                        match value_opt {
+                            Some(value) => action::app(Message::PasteValue(entity_opt, value.0)),
+                            None => action::none(),
+                        }
                     }),
                 ]);
             }
@@ -2785,7 +3272,10 @@ impl Application for App {
                             terminal.active_regex_match = None;
                             terminal.needs_update = true;
 
-                            return Task::batch([clipboard::write(url), self.update_focus()]);
+                            return Task::batch([
+                                clipboard::write(url).map(|_| action::none()),
+                                self.update_focus(),
+                            ]);
                         }
                     }
                 }
@@ -2806,6 +3296,9 @@ impl Application for App {
                         terminal.needs_update = true;
                     }
                 }
+            }
+            Message::LocalShell => {
+                return self.create_and_focus_new_terminal(self.pane_model.focused(), None, false);
             }
             Message::Modifiers(modifiers) => {
                 self.modifiers = modifiers;
@@ -2926,21 +3419,23 @@ impl Application for App {
                         let terminal = terminal.lock().unwrap();
                         terminal.paste(password.into_unsecure());
                         terminal.input_scroll(b"\n".as_slice());
-                        self.set_show_context(false);
-                        self.password_mgr.clear();
                     }
                 }
+                self.set_show_context(false);
+                self.password_mgr.clear();
             }
             Message::Paste(entity_opt) => {
-                return clipboard::read().map(move |value_opt| match value_opt {
-                    Some(value) => action::app(Message::PasteValue(entity_opt, value)),
-                    None => action::none(),
+                return clipboard::read_text().map(move |value| match value {
+                    Ok(text) => action::app(Message::PasteValue(entity_opt, text.to_string())),
+                    Err(_) => action::none(),
                 });
             }
             Message::PastePrimary(entity_opt) => {
-                return clipboard::read_primary().map(move |value_opt| match value_opt {
-                    Some(value) => action::app(Message::PasteValue(entity_opt, value)),
-                    None => action::none(),
+                return clipboard::read_primary_data::<PrimaryText>().map(move |value_opt| {
+                    match value_opt {
+                        Some(value) => action::app(Message::PasteValue(entity_opt, value.0)),
+                        None => action::none(),
+                    }
                 });
             }
             Message::PasteValue(entity_opt, value) => {
@@ -3048,6 +3543,445 @@ impl Application for App {
                 if let Some(profile) = self.config.profiles.get_mut(&profile_id) {
                     profile.tab_title = text;
                     return self.save_profiles();
+                }
+            }
+            Message::SshSessionContextAction(action) => match action {
+                SshSessionContextAction::New => return self.update(Message::SshSessionNew),
+                SshSessionContextAction::Connect(session_id) => {
+                    return self.update(Message::SshSessionConnect(session_id));
+                }
+                SshSessionContextAction::Edit(session_id) => {
+                    return self.update(Message::SshSessionEdit(session_id));
+                }
+                SshSessionContextAction::Remove(session_id) => {
+                    return self.update(Message::SshSessionRemove(session_id));
+                }
+                SshSessionContextAction::Import => {
+                    return self.update(Message::SshSessionsImport);
+                }
+                SshSessionContextAction::Export => {
+                    return self.update(Message::SshSessionsExport);
+                }
+            },
+            Message::SshSessionsExport => {
+                if !self.file_chooser_pending {
+                    self.file_chooser_pending = true;
+                    self.ssh_session_manager_notice = None;
+                    let file_name = "COSMIC SSH Sessions.ron".to_string();
+                    let window_id = self.core.main_window_id().unwrap_or(window::Id::RESERVED);
+                    return cosmic::window::identifier(window_id).then(move |identifier| {
+                        let file_name = file_name.clone();
+                        cosmic::task::future(async move {
+                            let dialog = file_chooser::save::Dialog::new()
+                                .title(fl!("export-ssh-sessions"))
+                                .file_name(file_name)
+                                .identifier(identifier);
+
+                            let outcome = match dialog.save_file().await {
+                                Ok(response) => match response.url() {
+                                    Some(url) => match url.to_file_path() {
+                                        Ok(path) => FileChooserOutcome::Selected(path),
+                                        Err(()) => FileChooserOutcome::Failed(format!(
+                                            "Save dialog returned non-local URL {url}"
+                                        )),
+                                    },
+                                    None => FileChooserOutcome::Failed(
+                                        "Save dialog did not return a file".to_string(),
+                                    ),
+                                },
+                                Err(file_chooser::Error::Cancelled) => {
+                                    FileChooserOutcome::Cancelled
+                                }
+                                Err(why) => {
+                                    FileChooserOutcome::Failed(format!("Save dialog failed: {why}"))
+                                }
+                            };
+                            Message::SshSessionsExportResult(outcome)
+                        })
+                    });
+                }
+            }
+            Message::SshSessionsExportResult(outcome) => {
+                self.file_chooser_pending = false;
+                let path = match outcome {
+                    FileChooserOutcome::Selected(path) => path,
+                    FileChooserOutcome::Cancelled => return Task::none(),
+                    FileChooserOutcome::Failed(why) => {
+                        self.ssh_session_manager_notice = Some(why);
+                        return Task::none();
+                    }
+                };
+                let sessions = self
+                    .config
+                    .ssh_sessions
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                match ron::ser::to_string_pretty(&sessions, ron::ser::PrettyConfig::new()) {
+                    Ok(contents) => match fs::write(&path, contents) {
+                        Ok(()) => {
+                            self.ssh_session_manager_notice =
+                                Some(fl!("ssh-sessions-exported", count = sessions.len()));
+                        }
+                        Err(err) => {
+                            self.ssh_session_manager_notice = Some(fl!(
+                                "ssh-sessions-export-failed",
+                                error = format!("{path:?}: {err}")
+                            ));
+                        }
+                    },
+                    Err(err) => {
+                        self.ssh_session_manager_notice =
+                            Some(fl!("ssh-sessions-export-failed", error = err.to_string()));
+                    }
+                }
+            }
+            Message::SshSessionsImport => {
+                if !self.file_chooser_pending {
+                    self.file_chooser_pending = true;
+                    self.ssh_session_manager_notice = None;
+                    let window_id = self.core.main_window_id().unwrap_or(window::Id::RESERVED);
+                    return cosmic::window::identifier(window_id).then(move |identifier| {
+                        cosmic::task::future(async move {
+                            let dialog = file_chooser::open::Dialog::new()
+                                .title(fl!("import-ssh-sessions"))
+                                .identifier(identifier);
+
+                            let outcome = match dialog.open_files().await {
+                                Ok(response) => {
+                                    let mut paths = Vec::with_capacity(response.urls().len());
+                                    for url in response.urls() {
+                                        match url.to_file_path() {
+                                            Ok(path) => paths.push(path),
+                                            Err(()) => log::error!(
+                                                "SSH session import returned non-local URL {url}"
+                                            ),
+                                        }
+                                    }
+                                    if paths.is_empty() {
+                                        FileChooserOutcome::Failed(
+                                            "Open dialog did not return any local files"
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        FileChooserOutcome::Selected(paths)
+                                    }
+                                }
+                                Err(file_chooser::Error::Cancelled) => {
+                                    FileChooserOutcome::Cancelled
+                                }
+                                Err(why) => {
+                                    FileChooserOutcome::Failed(format!("Open dialog failed: {why}"))
+                                }
+                            };
+                            Message::SshSessionsImportResult(outcome)
+                        })
+                    });
+                }
+            }
+            Message::SshSessionsImportResult(outcome) => {
+                self.file_chooser_pending = false;
+                let paths = match outcome {
+                    FileChooserOutcome::Selected(paths) => paths,
+                    FileChooserOutcome::Cancelled => return Task::none(),
+                    FileChooserOutcome::Failed(why) => {
+                        self.ssh_session_manager_notice = Some(why);
+                        return Task::none();
+                    }
+                };
+
+                let previous = self.config.ssh_sessions.clone();
+                let mut imported_count = 0;
+                let mut skipped_count = 0;
+                let mut errors = Vec::new();
+                for path in paths {
+                    let contents = match fs::read_to_string(&path) {
+                        Ok(contents) => contents,
+                        Err(err) => {
+                            skipped_count += 1;
+                            errors.push(format!("{}: {err}", path.display()));
+                            continue;
+                        }
+                    };
+                    let sessions = match parse_ssh_sessions(&contents) {
+                        Ok(sessions) => sessions,
+                        Err(err) => {
+                            skipped_count += 1;
+                            errors.push(format!("{}: {err}", path.display()));
+                            continue;
+                        }
+                    };
+
+                    for imported in sessions {
+                        let editor = SshSessionEditor::from_session(SshSessionId(0), &imported);
+                        let session = match validate_ssh_session(&editor) {
+                            Ok(session) => session,
+                            Err(err) => {
+                                skipped_count += 1;
+                                errors.push(format!(
+                                    "{}: invalid SSH session ({err:?})",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                        };
+                        if self
+                            .config
+                            .ssh_sessions
+                            .values()
+                            .any(|existing| existing == &session)
+                        {
+                            skipped_count += 1;
+                            continue;
+                        }
+                        let Some(session_id) = next_ssh_session_id(&self.config.ssh_sessions)
+                        else {
+                            errors.push(fl!("ssh-session-limit"));
+                            break;
+                        };
+                        self.config.ssh_sessions.insert(session_id, session);
+                        imported_count += 1;
+                    }
+                }
+
+                if imported_count > 0 {
+                    self.rebuild_session_nav_model();
+                    if let Err(err) = self.save_ssh_sessions() {
+                        self.config.ssh_sessions = previous;
+                        self.rebuild_session_nav_model();
+                        self.ssh_session_manager_notice =
+                            Some(fl!("ssh-session-save-failed", error = err.as_str()));
+                        return Task::none();
+                    }
+                }
+
+                let mut notice = fl!(
+                    "ssh-sessions-import-summary",
+                    imported = imported_count,
+                    skipped = skipped_count
+                );
+                if !errors.is_empty() {
+                    notice.push_str("\n");
+                    notice.push_str(&errors.join("\n"));
+                }
+                self.ssh_session_manager_notice = Some(notice);
+            }
+            Message::SshSessionManagerDismiss => {
+                self.ssh_session_manager_notice = None;
+                return self.update_focus();
+            }
+            Message::SshSessionCancel => {
+                self.ssh_session_editor = None;
+                return self.update_focus();
+            }
+            Message::SshSessionConnect(session_id) => {
+                let nav_entity = self.session_nav_model.iter().find(|entity| {
+                    self.session_nav_model
+                        .data::<SessionNavEntry>(*entity)
+                        .copied()
+                        == Some(SessionNavEntry::Ssh(session_id))
+                });
+                if let Some(nav_entity) = nav_entity {
+                    self.session_nav_model.activate(nav_entity);
+                }
+
+                let existing = self.pane_model.panes.iter().find_map(|(pane, tab_model)| {
+                    tab_model.iter().find_map(|entity| {
+                        let terminal = tab_model.data::<Mutex<Terminal>>(entity)?;
+                        (terminal.lock().unwrap().ssh_session_id() == Some(session_id))
+                            .then_some((*pane, entity))
+                    })
+                });
+                if let Some((pane, entity)) = existing {
+                    self.pane_model.set_focus(pane);
+                    if let Some(tab_model) = self.pane_model.panes.get_mut(pane) {
+                        tab_model.activate(entity);
+                    }
+                    return self.update_title(Some(pane));
+                }
+
+                if let Some(session) = self.config.ssh_sessions.get(&session_id).cloned() {
+                    return self.create_and_focus_new_terminal_with_options(
+                        self.pane_model.focused(),
+                        None,
+                        false,
+                        Some((
+                            ssh_session_options(&session),
+                            Some(session.name),
+                            Some(session_id),
+                        )),
+                    );
+                }
+            }
+            Message::SshSessionEdit(session_id) => {
+                if let Some(session) = self.config.ssh_sessions.get(&session_id) {
+                    self.ssh_session_editor =
+                        Some(SshSessionEditor::from_session(session_id, session));
+                    return widget::text_input::focus(self.ssh_session_name_id.clone());
+                }
+            }
+            Message::SshSessionHost(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.host = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionIdentityFile(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.identity_file = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionJumpHost(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.jump_host = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionCommand(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.command = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionCompression(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.compression = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionSendLocale(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.send_locale = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionKeepOpen(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.keep_open = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionName(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.name = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionNew => {
+                self.ssh_session_editor = Some(SshSessionEditor::new());
+                self.ssh_session_delete_pending = None;
+                self.ssh_session_delete_error = None;
+                return widget::text_input::focus(self.ssh_session_name_id.clone());
+            }
+            Message::SshSessionPort(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.port = value;
+                    editor.error = None;
+                }
+            }
+            Message::SshSessionRemove(session_id) => {
+                if self.config.ssh_sessions.contains_key(&session_id) {
+                    self.ssh_session_delete_pending = Some(session_id);
+                    self.ssh_session_delete_error = None;
+                }
+            }
+            Message::SshSessionDeleteCancel => {
+                self.ssh_session_delete_pending = None;
+                self.ssh_session_delete_error = None;
+                return self.update_focus();
+            }
+            Message::SshSessionDeleteConfirm => {
+                let Some(session_id) = self.ssh_session_delete_pending else {
+                    return Task::none();
+                };
+                let Some(session) = self.config.ssh_sessions.remove(&session_id) else {
+                    self.ssh_session_delete_pending = None;
+                    return Task::none();
+                };
+                self.rebuild_session_nav_model();
+                match self.save_ssh_sessions() {
+                    Ok(()) => {
+                        self.ssh_session_delete_pending = None;
+                        self.ssh_session_delete_error = None;
+                        return self.update_focus();
+                    }
+                    Err(err) => {
+                        self.config.ssh_sessions.insert(session_id, session);
+                        self.rebuild_session_nav_model();
+                        self.ssh_session_delete_error =
+                            Some(fl!("ssh-session-save-failed", error = err.as_str()));
+                    }
+                }
+            }
+            Message::SshSessionSave => {
+                let Some(editor) = self.ssh_session_editor.clone() else {
+                    return Task::none();
+                };
+                let session = match validate_ssh_session(&editor) {
+                    Ok(session) => session,
+                    Err(SshSessionValidationError::HostRequired) => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-host-required"));
+                        return Task::none();
+                    }
+                    Err(SshSessionValidationError::HostInvalid) => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-host-invalid"));
+                        return Task::none();
+                    }
+                    Err(SshSessionValidationError::UsernameInvalid) => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-username-invalid"));
+                        return Task::none();
+                    }
+                    Err(SshSessionValidationError::JumpHostInvalid) => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-jump-host-invalid"));
+                        return Task::none();
+                    }
+                    Err(SshSessionValidationError::PortInvalid) => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-port-invalid"));
+                        return Task::none();
+                    }
+                };
+                let session_id = match editor
+                    .id
+                    .or_else(|| next_ssh_session_id(&self.config.ssh_sessions))
+                {
+                    Some(id) => id,
+                    None => {
+                        self.ssh_session_editor.as_mut().unwrap().error =
+                            Some(fl!("ssh-session-limit"));
+                        return Task::none();
+                    }
+                };
+                let previous = self.config.ssh_sessions.insert(session_id, session);
+                self.rebuild_session_nav_model();
+                match self.save_ssh_sessions() {
+                    Ok(()) => {
+                        self.ssh_session_editor = None;
+                        return self.update_focus();
+                    }
+                    Err(err) => {
+                        if let Some(previous) = previous {
+                            self.config.ssh_sessions.insert(session_id, previous);
+                        } else {
+                            self.config.ssh_sessions.remove(&session_id);
+                        }
+                        self.rebuild_session_nav_model();
+                        if let Some(editor) = &mut self.ssh_session_editor {
+                            editor.error =
+                                Some(fl!("ssh-session-save-failed", error = err.as_str()));
+                        }
+                    }
+                }
+            }
+            Message::SshSessionUsername(value) => {
+                if let Some(editor) = &mut self.ssh_session_editor {
+                    editor.username = value;
+                    editor.error = None;
                 }
             }
             Message::SelectAll(entity_opt) => {
@@ -3274,9 +4208,10 @@ impl Application for App {
                         match kind {
                             term::ClipboardType::Clipboard => {
                                 log::info!("clipboard load");
-                                return clipboard::read().map(move |data_opt| {
-                                    //TODO: what to do when data_opt is None?
-                                    callback(&data_opt.unwrap_or_default());
+                                return clipboard::read_text().map(move |data| {
+                                    if let Ok(text) = data {
+                                        callback(&text);
+                                    }
                                     // We don't need to do anything else
                                     action::none()
                                 });
@@ -3289,7 +4224,7 @@ impl Application for App {
                     TermEvent::ClipboardStore(kind, data) => match kind {
                         term::ClipboardType::Clipboard => {
                             log::info!("clipboard store");
-                            return clipboard::write(data);
+                            return clipboard::write(data).map(|_| action::none());
                         }
                         term::ClipboardType::Selection => {
                             log::info!("TODO: store selection");
@@ -3372,6 +4307,16 @@ impl Application for App {
                     }
                 }
             }
+            Message::TerminalSpawnRetry(pane, entity) => {
+                if let Some(tab_model) = self.pane_model.panes.get(pane)
+                    && let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity)
+                {
+                    if let Err(err) = terminal.lock().unwrap().retry_spawn_pty() {
+                        log::error!("failed to retry terminal pty spawn: {}", err);
+                    }
+                }
+                return self.update_focus();
+            }
             Message::TermEventTx(term_event_tx) => {
                 // Check if the terminal event channel was reset
                 if self.term_event_tx_opt.is_some() {
@@ -3404,6 +4349,11 @@ impl Application for App {
             Message::ToggleContextPage(context_page) => {
                 if self.context_page == context_page {
                     let show_context = !self.core.window.show_context;
+                    if show_context {
+                        self.ssh_session_editor = None;
+                        self.ssh_session_delete_pending = None;
+                        self.ssh_session_delete_error = None;
+                    }
                     self.set_show_context(show_context);
                     self.pane_model.update_terminal_focus();
 
@@ -3429,6 +4379,9 @@ impl Application for App {
 
                     return self.update_focus();
                 } else {
+                    self.ssh_session_editor = None;
+                    self.ssh_session_delete_pending = None;
+                    self.ssh_session_delete_error = None;
                     self.context_page = context_page;
                     self.set_show_context(true);
                     self.pane_model.unfocus_all_terminals();
@@ -3588,6 +4541,136 @@ impl Application for App {
             return Some(widget::Space::new().into());
         }
 
+        if let Some(editor) = &self.ssh_session_editor {
+            let title = if editor.id.is_some() {
+                fl!("edit-ssh-session")
+            } else {
+                fl!("new-ssh-session")
+            };
+            let controls = widget::column::with_children::<Element<'_, Message>>(vec![
+                widget::text::heading(fl!("ssh-connection")).into(),
+                widget::settings::item::builder(fl!("session-name"))
+                    .control(
+                        widget::text_input("", &editor.name)
+                            .id(self.ssh_session_name_id.clone())
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionName),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-host"))
+                    .control(
+                        widget::text_input("", &editor.host)
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionHost),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-username"))
+                    .control(
+                        widget::text_input("", &editor.username)
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionUsername),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-port"))
+                    .control(
+                        widget::text_input("", &editor.port)
+                            .width(Length::Fixed(100.0))
+                            .on_input(Message::SshSessionPort),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-identity-file"))
+                    .control(
+                        widget::text_input("", &editor.identity_file)
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionIdentityFile),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-jump-host"))
+                    .control(
+                        widget::text_input("", &editor.jump_host)
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionJumpHost),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-execute-command"))
+                    .control(
+                        widget::text_input("", &editor.command)
+                            .width(Length::Fixed(250.0))
+                            .on_input(Message::SshSessionCommand),
+                    )
+                    .into(),
+                widget::text::heading(fl!("ssh-options")).into(),
+                widget::settings::item::builder(fl!("ssh-compression"))
+                    .control(
+                        widget::toggler(editor.compression)
+                            .on_toggle(Message::SshSessionCompression),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-send-locale"))
+                    .control(
+                        widget::toggler(editor.send_locale)
+                            .on_toggle(Message::SshSessionSendLocale),
+                    )
+                    .into(),
+                widget::settings::item::builder(fl!("ssh-keep-open"))
+                    .control(
+                        widget::toggler(editor.keep_open).on_toggle(Message::SshSessionKeepOpen),
+                    )
+                    .into(),
+            ])
+            .spacing(6)
+            .width(Length::Fill);
+            let controls = widget::container(widget::scrollable(controls))
+                .max_height(520.0)
+                .width(Length::Fill);
+
+            let mut dialog = widget::dialog()
+                .title(title)
+                .control(controls)
+                .primary_action(
+                    widget::button::suggested(fl!("save")).on_press(Message::SshSessionSave),
+                )
+                .secondary_action(
+                    widget::button::standard(fl!("cancel")).on_press(Message::SshSessionCancel),
+                );
+            if let Some(error) = &editor.error {
+                dialog = dialog.tertiary_action(widget::text::body(error.as_str()));
+            }
+            return Some(dialog.into());
+        }
+
+        if let Some(session) = self
+            .ssh_session_delete_pending
+            .and_then(|id| self.config.ssh_sessions.get(&id))
+        {
+            let body = fl!("confirm-delete-ssh-session", name = session.name.as_str());
+            let mut dialog = widget::dialog()
+                .title(fl!("delete-session"))
+                .body(body)
+                .primary_action(
+                    button::destructive(fl!("delete")).on_press(Message::SshSessionDeleteConfirm),
+                )
+                .secondary_action(
+                    button::standard(fl!("cancel")).on_press(Message::SshSessionDeleteCancel),
+                );
+            if let Some(error) = &self.ssh_session_delete_error {
+                dialog = dialog.tertiary_action(widget::text::body(error.as_str()));
+            }
+            return Some(dialog.into());
+        }
+
+        if let Some(notice) = &self.ssh_session_manager_notice {
+            return Some(
+                widget::dialog()
+                    .title(fl!("ssh-session-manager"))
+                    .body(notice.as_str())
+                    .primary_action(
+                        button::suggested(fl!("done")).on_press(Message::SshSessionManagerDismiss),
+                    )
+                    .into(),
+            );
+        }
+
         let conflict = self.shortcut_conflict.as_ref()?;
         let binding = shortcuts::binding_display(&conflict.binding);
         let existing = shortcuts::action_label(conflict.existing_action);
@@ -3620,7 +4703,7 @@ impl Application for App {
         let view = move |_key: &menu::MenuBarKey| -> Element<'static, Message> {
             menu_bar(&self.core, &self.config, &self.key_binds)
         };
-        vec![widget::lazy(key, view).into()]
+        vec![Element::new(widget::lazy(key, view))]
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
@@ -3666,7 +4749,8 @@ impl Application for App {
                 .into()
         };
         let pane_grid = PaneGrid::new(&self.pane_model.panes, |pane, tab_model, _is_maximized| {
-            let mut tab_column = widget::column::with_capacity(1);
+            let mut tab_column: widget::Column<Element<'_, Message>> =
+                widget::column::with_capacity(1);
 
             if tab_model.iter().count() > 1 {
                 tab_column = tab_column.push(
@@ -3687,30 +4771,24 @@ impl Application for App {
                         cosmic::iced::widget::container::Style {
                             icon_color: Some(Color::from(cosmic.background(theme.transparent).on)),
                             text_color: Some(Color::from(cosmic.background(theme.transparent).on)),
-                            background: Some(iced::Background::Color(
-                                cosmic.background(theme.transparent).base.into(),
-                            )),
+                            background: None,
                             border: iced::Border::default(),
                             shadow: iced::Shadow::default(),
                             snap: true,
                         }
                     })))
-                    .padding([0, space_xxs, 0, space_xxs])
                     .width(Length::Fill),
                 );
                 tab_column = tab_column.push(
-                    widget::container(
-                        widget::divider::horizontal::default().class(style::Rule::custom(
-                            |theme| iced::widget::rule::Style {
-                                color: theme.cosmic().accent.base.into(),
-                                radius: 0.0.into(),
-                                fill_mode: iced::widget::rule::FillMode::Full,
-                                snap: true,
-                            },
-                        )),
-                    )
-                    .width(Length::Fill)
-                    .padding([0, space_xxs]),
+                    widget::container(widget::divider::horizontal::default().class(
+                        style::Rule::custom(|theme| iced::widget::rule::Style {
+                            color: theme.cosmic().accent.base.into(),
+                            radius: 0.0.into(),
+                            fill_mode: iced::widget::rule::FillMode::Full,
+                            snap: true,
+                        }),
+                    ))
+                    .width(Length::Fill),
                 );
             }
 
@@ -3732,11 +4810,12 @@ impl Application for App {
                     .on_window_focused(|| Message::WindowFocused)
                     .on_window_unfocused(|| Message::WindowUnfocused)
                     .opacity(if t.transparent {
-                        t.cosmic().alpha_map.blurred_alpha(t.cosmic().frosted)
+                        // In frosted mode, the parent container provides the
+                        // backdrop; leave the terminal's default cells clear.
+                        0.0
                     } else {
                         self.config.opacity_ratio()
                     })
-                    .padding(space_xxs)
                     .sharp_corners(self.core.window.sharp_corners)
                     .show_headerbar(self.config.show_headerbar)
                     .pane_border_radius(show_pane_borders.then_some(pane_corner_radius))
@@ -3760,16 +4839,16 @@ impl Application for App {
                 // Reuse the built menu until its inputs change; it is handed to
                 // the widget every frame so the popup can open on press.
                 let menu_trees = {
-                    let cached =
-                        self.context_menu_cache
-                            .borrow()
-                            .get(&pane)
-                            .is_some_and(|entry| {
-                                entry.entity == entity
-                                    && entry.link == link
-                                    && entry.show_headerbar == self.config.show_headerbar
-                                    && entry.menu_revision == self.menu_revision
-                            });
+                    let cached = self
+                        .context_menu_cache
+                        .borrow()
+                        .get(&pane)
+                        .is_some_and(|entry| {
+                            entry.entity == entity
+                                && entry.link == link
+                                && entry.show_headerbar == self.config.show_headerbar
+                                && entry.menu_revision == self.menu_revision
+                        });
                     if cached {
                         self.context_menu_cache
                             .borrow()
@@ -3778,12 +4857,8 @@ impl Application for App {
                             .trees
                             .clone()
                     } else {
-                        let trees = menu::context_menu(
-                            &self.config,
-                            &self.key_binds,
-                            entity,
-                            link.clone(),
-                        );
+                        let trees =
+                            menu::context_menu(&self.config, &self.key_binds, entity, link.clone());
                         self.context_menu_cache.borrow_mut().insert(
                             pane,
                             ContextMenuCacheEntry {
@@ -3797,7 +4872,40 @@ impl Application for App {
                         trees
                     }
                 };
-                let mut context_menu = widget::context_menu(terminal_box, Some(menu_trees))
+                let terminal_element: Element<'_, Message> =
+                    if let Some(error) = terminal.lock().unwrap().spawn_error() {
+                        let error = error.to_string();
+                        let error_overlay: Element<'_, Message> = widget::container(
+                            widget::column::with_children::<Element<'_, Message>>(vec![
+                                widget::text::body(fl!(
+                                    "terminal-spawn-failed",
+                                    error = error.as_str()
+                                ))
+                                .into(),
+                                button::standard(fl!("retry"))
+                                    .on_press(Message::TerminalSpawnRetry(pane, entity))
+                                    .into(),
+                            ])
+                            .spacing(space_s)
+                            .align_x(Alignment::Center),
+                        )
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
+                        .padding(space_s)
+                        .into();
+
+                        cosmic::iced::widget::Stack::<Element<'_, Message>>::with_children(vec![
+                            terminal_box.into(),
+                            error_overlay.into(),
+                        ])
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                    } else {
+                        terminal_box.into()
+                    };
+
+                let mut context_menu = widget::context_menu(terminal_element, Some(menu_trees))
                     .item_width(widget::menu::ItemWidth::Uniform(360))
                     .on_close(Message::TabContextMenu(pane, None))
                     .on_surface_action(Message::Surface);
@@ -3831,7 +4939,7 @@ impl Application for App {
                         .class(style::Button::Icon)
                         .into(),
                 );
-                let find_widget = widget::row::with_children(vec![
+                let find_widget = widget::row::with_children::<Element<'_, Message>>(vec![
                     find_input.into(),
                     widget::tooltip(
                         button::custom(icon_cache_get("go-up-symbolic", 16))
@@ -3888,15 +4996,22 @@ impl Application for App {
         .on_resize(space_xxs, Message::PaneResized)
         .on_drag(Message::PaneDragged);
 
-        //TODO: apply window border radius xs at bottom of window
-        if show_pane_borders {
+        let pane_grid: Element<'_, Message> = if show_pane_borders {
             // Each pane draws its own border stroke. Painting a filled
             // container behind the grid instead would stack its alpha with the
             // translucent panes and wash out the blurred backdrop.
-            pane_grid.spacing(space_xxxs).into()
+            Element::new(pane_grid.spacing(space_xxxs))
         } else {
-            pane_grid.into()
-        }
+            Element::new(pane_grid)
+        };
+
+        let window_edge_padding = self.core.window_border_padding();
+
+        widget::container(pane_grid)
+            .padding([0, window_edge_padding, window_edge_padding, 0])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn system_theme_update(
@@ -3993,7 +5108,207 @@ fn pane_border(cosmic: &cosmic_theme::Theme, transparent: bool, show: bool) -> i
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_border, pane_divider_color};
+    use super::{
+        App, Config, SessionNavEntry, SshSession, SshSessionEditor, SshSessionId,
+        SshSessionValidationError, next_ssh_session_id, pane_border, pane_divider_color,
+        parse_ssh_sessions, ssh_session_args, validate_ssh_session,
+    };
+    use std::collections::BTreeMap;
+
+    fn ssh_session(name: &str, host: &str) -> SshSession {
+        SshSession {
+            name: name.into(),
+            host: host.into(),
+            username: String::new(),
+            port: 22,
+            identity_file: String::new(),
+            jump_host: String::new(),
+            command: String::new(),
+            compression: false,
+            send_locale: false,
+            keep_open: false,
+        }
+    }
+
+    fn ssh_editor(host: &str, username: &str, port: &str) -> SshSessionEditor {
+        SshSessionEditor {
+            id: None,
+            name: String::new(),
+            host: host.to_string(),
+            username: username.to_string(),
+            port: port.to_string(),
+            identity_file: String::new(),
+            jump_host: String::new(),
+            command: String::new(),
+            compression: false,
+            send_locale: false,
+            keep_open: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn ssh_session_defaults_name_and_port() {
+        let session =
+            validate_ssh_session(&ssh_editor(" example.test ", "", "")).expect("valid SSH session");
+        assert_eq!(session.name, "example.test");
+        assert_eq!(session.host, "example.test");
+        assert_eq!(session.username, "");
+        assert_eq!(session.port, 22);
+        assert!(!session.compression);
+    }
+
+    #[test]
+    fn ssh_session_validation_rejects_ambiguous_or_option_like_destinations() {
+        assert_eq!(
+            validate_ssh_session(&ssh_editor("bob@example.test", "alice", "22")),
+            Err(SshSessionValidationError::HostInvalid)
+        );
+        assert_eq!(
+            validate_ssh_session(&ssh_editor("example.test", "-oProxyCommand=x", "22")),
+            Err(SshSessionValidationError::UsernameInvalid)
+        );
+        let mut editor = ssh_editor("example.test", "", "22");
+        editor.jump_host = "-oProxyCommand=x".into();
+        assert_eq!(
+            validate_ssh_session(&editor),
+            Err(SshSessionValidationError::JumpHostInvalid)
+        );
+    }
+
+    #[test]
+    fn ssh_session_validation_checks_port_range() {
+        assert_eq!(
+            validate_ssh_session(&ssh_editor("example.test", "", "0")),
+            Err(SshSessionValidationError::PortInvalid)
+        );
+        assert_eq!(
+            validate_ssh_session(&ssh_editor("example.test", "", "65536")),
+            Err(SshSessionValidationError::PortInvalid)
+        );
+    }
+
+    #[test]
+    fn ssh_session_ids_reuse_the_first_free_key_without_overwriting() {
+        let sessions = BTreeMap::from([
+            (SshSessionId(0), ssh_session("a", "a")),
+            (SshSessionId(1), ssh_session("b", "b")),
+            (SshSessionId(3), ssh_session("d", "d")),
+        ]);
+        assert_eq!(next_ssh_session_id(&sessions), Some(SshSessionId(2)));
+
+        let max_only = BTreeMap::from([(SshSessionId(u64::MAX), ssh_session("max", "max"))]);
+        assert_eq!(next_ssh_session_id(&max_only), Some(SshSessionId(0)));
+    }
+
+    #[test]
+    fn ssh_session_username_and_port_keep_serde_defaults() {
+        let session: SshSession =
+            ron::from_str("(name: \"prod\", host: \"example.test\", x11_forwarding: true)")
+                .expect("legacy SSH session config");
+        assert_eq!(session.username, "");
+        assert_eq!(session.port, 22);
+        assert_eq!(session.identity_file, "");
+        assert_eq!(session.jump_host, "");
+        assert_eq!(session.command, "");
+        assert!(!session.compression);
+        assert!(!session.send_locale);
+        assert!(!session.keep_open);
+    }
+
+    #[test]
+    fn ssh_session_import_accepts_exported_lists_and_config_maps() {
+        let sessions = vec![ssh_session("production", "prod.example.test")];
+        let exported = ron::ser::to_string(&sessions).expect("serialize session list");
+        assert_eq!(
+            parse_ssh_sessions(&exported).expect("import session list"),
+            sessions
+        );
+
+        let config_map = BTreeMap::from([(SshSessionId(7), sessions[0].clone())]);
+        let exported_map = ron::ser::to_string(&config_map).expect("serialize session map");
+        assert_eq!(
+            parse_ssh_sessions(&exported_map).expect("import session map"),
+            sessions
+        );
+    }
+
+    #[test]
+    fn ssh_args_include_advanced_options_and_remote_command() {
+        let mut session = ssh_session("production", "prod.example.test");
+        session.username = "alice".into();
+        session.port = 2222;
+        session.identity_file = "/home/alice/.ssh/prod".into();
+        session.jump_host = "bastion".into();
+        session.command = "uptime".into();
+        session.compression = true;
+        session.send_locale = true;
+
+        assert_eq!(
+            ssh_session_args(&session),
+            vec![
+                "-p",
+                "2222",
+                "-C",
+                "-x",
+                "-o",
+                "SendEnv=LANG",
+                "-o",
+                "SendEnv=LC_*",
+                "-i",
+                "/home/alice/.ssh/prod",
+                "-J",
+                "bastion",
+                "alice@prod.example.test",
+                "uptime",
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_keep_open_requests_a_pty_and_starts_a_login_shell_after_command() {
+        let mut session = ssh_session("production", "prod.example.test");
+        session.command = "uptime".into();
+        session.keep_open = true;
+
+        assert_eq!(
+            ssh_session_args(&session),
+            vec![
+                "-x",
+                "-t",
+                "prod.example.test",
+                "uptime\nexec \"${SHELL:-/bin/sh}\" -l",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_nav_model_keeps_the_selected_ssh_session_when_rebuilt() {
+        let id = SshSessionId(4);
+        let mut config = Config::default();
+        config
+            .ssh_sessions
+            .insert(id, ssh_session("production", "prod.example.test"));
+
+        let model = App::build_session_nav_model(&config, Some(SessionNavEntry::Ssh(id)));
+        assert_eq!(model.len(), 2);
+        assert_eq!(
+            model.data::<SessionNavEntry>(model.active()).copied(),
+            Some(SessionNavEntry::Ssh(id))
+        );
+    }
+
+    #[test]
+    fn session_nav_model_falls_back_to_local_shell_if_selection_was_removed() {
+        let config = Config::default();
+        let model =
+            App::build_session_nav_model(&config, Some(SessionNavEntry::Ssh(SshSessionId(99))));
+
+        assert_eq!(
+            model.data::<SessionNavEntry>(model.active()).copied(),
+            Some(SessionNavEntry::LocalShell)
+        );
+    }
 
     #[test]
     fn pane_border_is_drawn_only_when_enabled() {

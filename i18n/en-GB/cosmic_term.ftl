@@ -1,5 +1,43 @@
 cosmic-terminal = COSMIC Terminal
 new-terminal = New terminal
+sessions = Sessions
+local-shell = Local shell
+new-ssh-session = New SSH session...
+edit-ssh-session = Edit SSH session
+connect-ssh-session = Connect
+edit-session = Edit
+delete-session = Delete
+save = Save
+done = Done
+session-name = Session name
+ssh-host = Host or SSH config alias
+ssh-username = Username (optional)
+ssh-port = Port
+ssh-connection = Connection
+ssh-identity-file = Private key file (optional)
+ssh-jump-host = SSH gateway / jump host (optional)
+ssh-execute-command = Execute command after connecting (optional)
+ssh-options = Options
+ssh-compression = Compress connection
+ssh-send-locale = Send local locale variables
+ssh-keep-open = Open an interactive shell after the command
+import-ssh-sessions = Import SSH sessions...
+export-ssh-sessions = Export SSH sessions...
+ssh-session-manager = SSH session manager
+ssh-sessions-exported = Exported { $count } SSH sessions.
+ssh-sessions-export-failed = Could not export SSH sessions: { $error }
+ssh-sessions-import-summary = Imported { $imported } SSH sessions; skipped { $skipped }.
+ssh-host-required = Enter a host or SSH config alias.
+ssh-host-invalid = Enter a host or alias without spaces, @, or a leading hyphen.
+ssh-username-invalid = Enter a username without spaces, @, or a leading hyphen.
+ssh-jump-host-invalid = Enter a jump host without spaces, commas, or a leading hyphen.
+ssh-port-invalid = Port must be a number from 1 to 65535.
+ssh-session-limit = Could not allocate an ID for this SSH session.
+terminal-spawn-failed = Failed to start the terminal process: { $error }
+retry = Retry
+toggle-sidebar = Toggle sidebar
+confirm-delete-ssh-session = Delete SSH session “{ $name }”?
+ssh-session-save-failed = Could not save SSH sessions: { $error }
 
 # Context Pages
 

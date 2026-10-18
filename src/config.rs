@@ -193,6 +193,38 @@ pub struct ColorScheme {
 #[serde(transparent)]
 pub struct ProfileId(pub u64);
 
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(transparent)]
+pub struct SshSessionId(pub u64);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SshSession {
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default = "ssh_port_default")]
+    pub port: u16,
+    #[serde(default)]
+    pub identity_file: String,
+    #[serde(default)]
+    pub jump_host: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub compression: bool,
+    #[serde(default)]
+    pub send_locale: bool,
+    #[serde(default)]
+    pub keep_open: bool,
+}
+
+fn ssh_port_default() -> u16 {
+    22
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Profile {
     pub name: String,
@@ -232,6 +264,14 @@ fn scrollback_lines_default() -> u32 {
     10_000
 }
 
+fn sidebar_width_default() -> u32 {
+    240
+}
+
+/// Bounds for the resizable session sidebar width, in logical pixels.
+pub const SIDEBAR_MIN_WIDTH: u32 = 160;
+pub const SIDEBAR_MAX_WIDTH: u32 = 480;
+
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     pub app_theme: AppTheme,
@@ -250,8 +290,12 @@ pub struct Config {
     pub graphics_mode: GraphicsMode,
     pub opacity: u8,
     pub profiles: BTreeMap<ProfileId, Profile>,
+    #[serde(default)]
+    pub ssh_sessions: BTreeMap<SshSessionId, SshSession>,
     #[serde(default = "scrollback_lines_default")]
     pub scrollback_lines: u32,
+    #[serde(default = "sidebar_width_default")]
+    pub sidebar_width: u32,
     pub show_headerbar: bool,
     pub show_pane_borders: bool,
     pub use_bright_bold: bool,
@@ -284,7 +328,9 @@ impl Default for Config {
             font_weight: Weight::NORMAL.0,
             opacity: 100,
             profiles: BTreeMap::new(),
+            ssh_sessions: BTreeMap::new(),
             scrollback_lines: scrollback_lines_default(),
+            sidebar_width: sidebar_width_default(),
             show_headerbar: true,
             show_pane_borders: false,
             syntax_theme_dark: COSMIC_THEME_DARK.to_string(),

@@ -61,6 +61,7 @@ pub enum KeyBindAction {
     Copy,
     CopyOrSigint,
     Find,
+    NewSshSession,
     PaneFocusDown,
     PaneFocusLeft,
     PaneFocusRight,
@@ -88,6 +89,7 @@ pub enum KeyBindAction {
     TabNext,
     TabPrev,
     ToggleFullscreen,
+    ToggleSidebar,
     WindowClose,
     WindowNew,
     ZoomIn,
@@ -103,6 +105,7 @@ impl KeyBindAction {
             Self::Copy => Some(Action::Copy),
             Self::CopyOrSigint => Some(Action::CopyOrSigint),
             Self::Find => Some(Action::Find),
+            Self::NewSshSession => Some(Action::NewSshSession),
             Self::PaneFocusDown => Some(Action::PaneFocusDown),
             Self::PaneFocusLeft => Some(Action::PaneFocusLeft),
             Self::PaneFocusRight => Some(Action::PaneFocusRight),
@@ -128,6 +131,7 @@ impl KeyBindAction {
             Self::TabNext => Some(Action::TabNext),
             Self::TabPrev => Some(Action::TabPrev),
             Self::ToggleFullscreen => Some(Action::ToggleFullscreen),
+            Self::ToggleSidebar => Some(Action::ToggleSidebar),
             Self::WindowClose => Some(Action::WindowClose),
             Self::WindowNew => Some(Action::WindowNew),
             Self::ZoomIn => Some(Action::ZoomIn),
@@ -263,6 +267,7 @@ pub fn action_label(action: KeyBindAction) -> String {
         KeyBindAction::Copy => fl!("copy"),
         KeyBindAction::CopyOrSigint => fl!("copy-or-sigint"),
         KeyBindAction::Find => fl!("find"),
+        KeyBindAction::NewSshSession => fl!("new-ssh-session"),
         KeyBindAction::PaneFocusDown => fl!("focus-pane-down"),
         KeyBindAction::PaneFocusLeft => fl!("focus-pane-left"),
         KeyBindAction::PaneFocusRight => fl!("focus-pane-right"),
@@ -289,6 +294,7 @@ pub fn action_label(action: KeyBindAction) -> String {
         KeyBindAction::TabNext => fl!("next-tab"),
         KeyBindAction::TabPrev => fl!("previous-tab"),
         KeyBindAction::ToggleFullscreen => fl!("toggle-fullscreen"),
+        KeyBindAction::ToggleSidebar => fl!("toggle-sidebar"),
         KeyBindAction::WindowClose => fl!("close-window"),
         KeyBindAction::WindowNew => fl!("new-window"),
         KeyBindAction::ZoomIn => fl!("zoom-in"),
@@ -363,7 +369,11 @@ pub fn shortcut_groups() -> Vec<ShortcutGroup> {
         ],
     });
     #[cfg_attr(not(feature = "password_manager"), allow(unused_mut))]
-    let mut other_actions = vec![KeyBindAction::ClearScrollback];
+    let mut other_actions = vec![
+        KeyBindAction::ClearScrollback,
+        KeyBindAction::NewSshSession,
+        KeyBindAction::ToggleSidebar,
+    ];
     #[cfg(feature = "password_manager")]
     other_actions.push(KeyBindAction::PasswordManager);
     groups.push(ShortcutGroup {
@@ -450,6 +460,8 @@ fn fallback_shortcuts() -> Shortcuts {
     bind!([Ctrl], "c", CopyOrSigint);
     bind!([Ctrl, Shift], "F", Find);
     bind!([Ctrl, Shift], "N", WindowNew);
+    bind!([Ctrl, Alt], "S", NewSshSession);
+    bind!([Ctrl, Alt], "B", ToggleSidebar);
     bind!([Ctrl, Shift], "Q", WindowClose);
     bind!([Ctrl, Shift], "T", TabNew);
     bind!([Ctrl, Shift], "V", Paste);

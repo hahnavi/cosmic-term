@@ -312,8 +312,8 @@ impl PasswordManager {
 
             if expanded && let Some(input_state) = &self.input_state {
                 let expanded_section: Section<'_, Message> = widget::settings::section().add(
-                    widget::column::with_children(vec![
-                        widget::column::with_children(vec![
+                    widget::column::with_children::<Element<'_, Message>>(vec![
+                        widget::column::with_children::<Element<'_, Message>>(vec![
                             widget::text(fl!("password-input-description")).into(),
                             widget::text_input("", input_state.input.identifier.clone())
                                 .on_input(move |text| {
@@ -333,7 +333,7 @@ impl PasswordManager {
                         ])
                         .spacing(space_xxxs)
                         .into(),
-                        widget::column::with_children(vec![
+                        widget::column::with_children::<Element<'_, Message>>(vec![
                             widget::text(fl!("password-input")).into(),
                             widget::secure_input(
                                 "",
@@ -370,13 +370,13 @@ impl PasswordManager {
                     right: space_s.into(),
                 };
 
-                passwords_section =
-                    passwords_section.add(widget::container(expanded_section).padding(padding))
+                passwords_section = passwords_section
+                    .add(widget::container(Element::from(expanded_section)).padding(padding))
             }
         }
         sections.push(passwords_section.into());
 
-        let add_password = widget::row::with_children(vec![
+        let add_password = widget::row::with_children::<Element<'_, Message>>(vec![
             widget::space::horizontal().into(),
             widget::button::standard(fl!("add-password"))
                 .on_press(Message::PasswordManager(PasswordManagerMessage::New))

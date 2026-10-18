@@ -21,7 +21,7 @@ use cosmic::{
 };
 use cosmic_text::{
     Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Family, FeatureTag, FontFeatures,
-    LineEnding, Scroll, ShapeRunCache, Shaping, Weight, Wrap,
+    LineEnding, Scroll, Shaping, Weight, Wrap,
 };
 use indexmap::IndexSet;
 use std::{
@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 pub use alacritty_terminal::grid::Scroll as TerminalScroll;
 
 use crate::{
-    config::{ColorSchemeKind, Config as AppConfig, ProfileId},
+    config::{ColorSchemeKind, Config as AppConfig, ProfileId, SshSessionId},
     menu::MenuState,
     mouse_reporter::MouseReporter,
 };
@@ -75,44 +75,6 @@ fn url_regex_search() -> MutexGuard<'static, RegexSearch> {
         .get_or_init(|| Mutex::new(RegexSearch::new(url_regex_pattern()).unwrap()))
         .lock()
         .unwrap()
-}
-
-// Measures the configured font cell size and derives the default terminal size for the pre-spawned PTY.
-pub fn startup_terminal_size(app_config: &AppConfig) -> Size {
-    let font_stretch = app_config.typed_font_stretch();
-    let font_weight = app_config.font_weight;
-    let metrics = app_config.metrics(0);
-
-    let attrs = Attrs::new()
-        .family(Family::Monospace)
-        .weight(Weight(font_weight))
-        .stretch(font_stretch);
-
-    let mut buffer = Buffer::new_empty(metrics);
-    let cell_width = {
-        let mut font_system = font_system().write().unwrap();
-        font_system
-            .raw()
-            .db_mut()
-            .set_monospace_family(&app_config.font_name);
-        let font_system = font_system.raw();
-        buffer.set_wrap(Wrap::None);
-
-        // Use size of space to determine cell size
-        buffer.set_text(" ", &attrs, Shaping::Advanced, None);
-        let layout = buffer.line_layout(font_system, 0).unwrap();
-        let cell_width = layout[0].w;
-
-        font_system.shape_run_cache = ShapeRunCache::default();
-        cell_width
-    };
-
-    Size {
-        width: (80.0 * cell_width).ceil() as u32,
-        height: (24.0 * metrics.line_height).ceil() as u32,
-        cell_width,
-        cell_height: metrics.line_height,
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1343,9 +1305,17 @@ pub struct Terminal {
     dim_font_weight: Weight,
     buffer_start_line: i32,
     mouse_reporter: MouseReporter,
-    notifier: Notifier,
+    /// Set once the PTY has been spawned. The shell starts on the first draw of
+    /// the active terminal, after its real size is known.
+    notifier: Option<Notifier>,
+    /// Shell options held until the pty is spawned.
+    options: tty::Options,
+    /// The last PTY startup error, shown in the terminal until a retry succeeds.
+    spawn_error: Option<String>,
+    event_proxy: EventProxy,
     search_regex_opt: Option<RegexSearch>,
     search_value: String,
+    ssh_session_id_opt: Option<SshSessionId>,
     shell_pid: Option<u32>,
     size: Size,
     visibility: Arc<TerminalVisibility>,
@@ -1363,12 +1333,11 @@ impl Terminal {
         event_tx: mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, Event)>,
         config: Config,
         options: Options,
-        startup_pty: Option<(tty::Pty, Size)>,
         app_config: &AppConfig,
         colors: Colors,
         profile_id_opt: Option<ProfileId>,
         tab_title_override: Option<String>,
-    ) -> Result<Self, io::Error> {
+    ) -> Self {
         let font_stretch = app_config.typed_font_stretch();
         let font_weight = app_config.font_weight;
         let dim_font_weight = app_config.dim_font_weight;
@@ -1423,29 +1392,7 @@ impl Terminal {
             event_proxy.clone(),
         )));
 
-        let window_id = 0;
-        let pty = match startup_pty {
-            Some((mut pty, startup_size)) => {
-                if startup_size.cell_width != size.cell_width
-                    || startup_size.cell_height != size.cell_height
-                {
-                    pty.on_resize(size.into());
-                }
-                pty
-            }
-            None => tty::new(&options, size.into(), window_id)?,
-        };
-        #[cfg(not(windows))]
-        let shell_pid = Some(pty.child().id());
-        #[cfg(windows)]
-        let shell_pid = pty.child_watcher().pid().map(|pid| pid.get());
-
-        let pty_event_loop =
-            EventLoop::new(term.clone(), event_proxy, pty, options.drain_on_exit, false)?;
-        let notifier = Notifier(pty_event_loop.channel());
-        let _pty_join_handle = pty_event_loop.spawn();
-
-        Ok(Self {
+        Self {
             active_regex_match: None,
             active_hyperlink_id: None,
             hovered_link: None,
@@ -1461,11 +1408,15 @@ impl Terminal {
             metadata_set,
             mouse_reporter: Default::default(),
             needs_update: true,
-            notifier,
+            notifier: None,
+            options,
+            spawn_error: None,
+            event_proxy,
             profile_id_opt,
             search_regex_opt: None,
             search_value: String::new(),
-            shell_pid,
+            ssh_session_id_opt: None,
+            shell_pid: None,
             size,
             visibility,
             tab_title_override,
@@ -1474,11 +1425,91 @@ impl Terminal {
             use_bright_bold,
             zoom_adj: Default::default(),
             is_focused: true,
-        })
+        }
+    }
+
+    /// Spawn the shell directly at the current [`Terminal::size`], so the
+    /// shell never observes a differently sized window. Called on the first
+    /// draw of the active terminal.
+    fn spawn_pty(&mut self) -> Result<(), io::Error> {
+        let window_id = 0;
+        let create_event_loop = |options: &tty::Options| {
+            let pty = tty::new(options, self.size.into(), window_id)?;
+            #[cfg(not(windows))]
+            let shell_pid = Some(pty.child().id());
+            #[cfg(windows)]
+            let shell_pid = pty.child_watcher().pid().map(|pid| pid.get());
+
+            let event_loop = EventLoop::new(
+                self.term.clone(),
+                self.event_proxy.clone(),
+                pty,
+                options.drain_on_exit,
+                false,
+            )?;
+            Ok::<_, io::Error>((event_loop, shell_pid))
+        };
+
+        let (pty_event_loop, shell_pid) = match create_event_loop(&self.options) {
+            Ok(event_loop) => event_loop,
+            Err(profile_err) if self.profile_id_opt.is_some() => {
+                log::error!(
+                    "failed to open terminal with profile {:?}: {}; falling back to the default shell",
+                    self.profile_id_opt,
+                    profile_err
+                );
+
+                // Keep a bad profile command from leaving the only tab empty.
+                // This restores the plain-shell recovery path from before PTY
+                // creation was deferred until the terminal is first drawn.
+                let fallback_options = tty::Options::default();
+                let event_loop = create_event_loop(&fallback_options)?;
+                self.options = fallback_options;
+                self.profile_id_opt = None;
+                self.tab_title_override = None;
+                self.event_proxy.send_event(Event::ResetTitle);
+                event_loop
+            }
+            Err(err) => return Err(err),
+        };
+        self.notifier = Some(Notifier(pty_event_loop.channel()));
+        let _pty_join_handle = pty_event_loop.spawn();
+        self.shell_pid = shell_pid;
+        self.spawn_error = None;
+        Ok(())
+    }
+
+    pub fn spawn_error(&self) -> Option<&str> {
+        self.spawn_error.as_deref()
+    }
+
+    /// Retry PTY startup after the user has been shown the previous error.
+    pub fn retry_spawn_pty(&mut self) -> Result<(), io::Error> {
+        self.spawn_error = None;
+        self.term.lock().resize(self.size);
+        match self.spawn_pty() {
+            Ok(()) => {
+                self.needs_update = true;
+                Ok(())
+            }
+            Err(err) => {
+                self.spawn_error = Some(err.to_string());
+                self.needs_update = true;
+                Err(err)
+            }
+        }
     }
 
     pub fn buffer_weak(&self) -> Weak<Buffer> {
         Arc::downgrade(&self.buffer)
+    }
+
+    pub fn set_ssh_session_id(&mut self, id: SshSessionId) {
+        self.ssh_session_id_opt = Some(id);
+    }
+
+    pub fn ssh_session_id(&self) -> Option<SshSessionId> {
+        self.ssh_session_id_opt
     }
 
     /// Get the internal [`Buffer`]
@@ -1561,7 +1592,9 @@ impl Terminal {
     }
 
     pub fn input_no_scroll<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
-        self.notifier.notify(input);
+        if let Some(notifier) = &self.notifier {
+            notifier.notify(input);
+        }
     }
 
     pub fn working_directory(&self) -> Option<PathBuf> {
@@ -1604,7 +1637,8 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width != self.size.width || height != self.size.height {
+        let dimensions_changed = width != self.size.width || height != self.size.height;
+        if dimensions_changed {
             let instant = Instant::now();
 
             // Clamp dimensions to ensure at least 1 row and 1 column,
@@ -1614,16 +1648,35 @@ impl Terminal {
             self.size.width = width.max(min_width);
             self.size.height = height.max(min_height);
 
-            self.notifier.on_resize(self.size.into());
+            if let Some(notifier) = &mut self.notifier {
+                notifier.on_resize(self.size.into());
+            }
             self.term.lock().resize(self.size);
-
-            self.with_buffer_mut(|buffer| {
-                buffer.set_size(Some(width as f32), Some(height as f32));
-            });
 
             self.needs_update = true;
 
             log::debug!("resize {:?}", instant.elapsed());
+        }
+
+        // The text buffer has no size until its first draw. Initialize it even
+        // when the first viewport exactly matches the 80x24 placeholder.
+        self.with_buffer_mut(|buffer| {
+            buffer.set_size(Some(width as f32), Some(height as f32));
+        });
+
+        // Spawn independently of the size delta: the initial 80x24 placeholder
+        // can match the first viewport exactly. Once a failure is displayed,
+        // retry is explicit so a persistent failure cannot create a redraw loop.
+        if self.notifier.is_none() && self.spawn_error.is_none() {
+            if !dimensions_changed {
+                self.term.lock().resize(self.size);
+            }
+            if let Err(err) = self.spawn_pty() {
+                log::error!("failed to spawn terminal pty: {}", err);
+                self.spawn_error = Some(err.to_string());
+                self.needs_update = true;
+                self.event_proxy.send_event(Event::Wakeup);
+            }
         }
     }
 
@@ -2419,17 +2472,20 @@ impl Terminal {
         let is_sgr = self.term.lock().mode().contains(TermMode::SGR_MOUSE);
 
         if is_sgr {
-            let codes = self.mouse_reporter.sgr_mouse_wheel_scroll(
-                self.size().cell_width,
-                self.size().cell_height,
-                delta,
-                modifiers,
-                x,
-                y,
-            );
+            let codes: Vec<Vec<u8>> = self
+                .mouse_reporter
+                .sgr_mouse_wheel_scroll(
+                    self.size().cell_width,
+                    self.size().cell_height,
+                    delta,
+                    modifiers,
+                    x,
+                    y,
+                )
+                .collect();
 
             for code in codes {
-                self.notifier.notify(code);
+                self.input_no_scroll(code);
             }
         } else {
             self.scroll_as_arrows(delta);
@@ -2631,9 +2687,12 @@ impl<'a, T> Iterator for HintPostProcessor<'a, T> {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Ensure shutdown on terminal drop
-        if let Err(err) = self.notifier.0.send(Msg::Shutdown) {
-            log::warn!("Failed to send shutdown message on dropped terminal: {err}");
+        // Ensure shutdown on terminal drop; a terminal that was never drawn
+        // has no pty or event loop to shut down.
+        if let Some(notifier) = &self.notifier {
+            if let Err(err) = notifier.0.send(Msg::Shutdown) {
+                log::warn!("Failed to send shutdown message on dropped terminal: {err}");
+            }
         }
     }
 }
