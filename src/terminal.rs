@@ -2418,7 +2418,7 @@ impl Terminal {
         let col = x / self.size.cell_width;
         let row = (y / self.size.cell_height).max(0.0);
         Point::new(
-            Line(self.viewport_row_to_line(row)),
+            Line(self.viewport_row_to_visible_line(row)),
             Column(col.max(0.0) as usize),
         )
     }
@@ -2432,6 +2432,30 @@ impl Terminal {
                 row,
             )
         })
+    }
+
+    pub fn visible_line_range(&self) -> (i32, i32) {
+        let display_offset = self.term.lock().grid().display_offset() as i32;
+        let screen_lines = self.size.screen_lines() as i32;
+        (-display_offset, screen_lines - 1 - display_offset)
+    }
+
+    pub fn viewport_row_to_visible_line(&self, row: f32) -> i32 {
+        let (_, bottom) = self.visible_line_range();
+        self.with_buffer(|buffer| {
+            line_at_visible_viewport_row(
+                self.buffer_start_line,
+                buffer.scroll(),
+                self.size.cell_height,
+                row,
+                bottom,
+            )
+        })
+    }
+
+    pub fn viewport_row_of_line(&self, line: i32) -> f32 {
+        let scroll = self.with_buffer(|buffer| buffer.scroll());
+        row_of_viewport_line(self.buffer_start_line, scroll, self.size.cell_height, line)
     }
 
     pub fn report_mouse(
@@ -2706,6 +2730,30 @@ fn line_at_viewport_row(buffer_start_line: i32, scroll: Scroll, cell_height: f32
     buffer_start_line + scroll.line as i32 + (row + vertical).floor() as i32
 }
 
+fn line_at_visible_viewport_row(
+    buffer_start_line: i32,
+    scroll: Scroll,
+    cell_height: f32,
+    row: f32,
+    bottom_line: i32,
+) -> i32 {
+    line_at_viewport_row(buffer_start_line, scroll, cell_height, row).min(bottom_line)
+}
+
+fn row_of_viewport_line(
+    buffer_start_line: i32,
+    scroll: Scroll,
+    cell_height: f32,
+    line: i32,
+) -> f32 {
+    let vertical = if cell_height > 0.0 {
+        scroll.vertical / cell_height
+    } else {
+        0.0
+    };
+    (line - buffer_start_line - scroll.line as i32) as f32 - vertical
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2759,6 +2807,116 @@ mod tests {
             line_at_viewport_row(-16, scroll, CELL_HEIGHT, 1.5),
             1,
             "following rows stay aligned"
+        );
+    }
+
+    #[test]
+    fn visible_hit_test_keeps_the_partially_visible_top_line() {
+        const CELL_HEIGHT: f32 = 20.0;
+
+        let scroll = Scroll {
+            line: 15,
+            vertical: CELL_HEIGHT / 2.0,
+            horizontal: 0.0,
+        };
+
+        assert_eq!(line_at_viewport_row(-16, scroll, CELL_HEIGHT, 0.0), -1);
+        assert_eq!(
+            line_at_visible_viewport_row(-16, scroll, CELL_HEIGHT, 0.0, 23),
+            -1,
+            "the partially visible top line remains selectable"
+        );
+    }
+
+    #[test]
+    fn visible_hit_test_keeps_the_last_line_reachable_with_a_partial_line_offset() {
+        const CELL_HEIGHT: f32 = 20.0;
+        const LAST_LINE: i32 = 23;
+
+        let scroll = Scroll {
+            line: 15,
+            vertical: CELL_HEIGHT - 4.0,
+            horizontal: 0.0,
+        };
+        let buffer_start_line = -16;
+
+        let last_row = row_of_viewport_line(buffer_start_line, scroll, CELL_HEIGHT, LAST_LINE);
+        assert!(
+            last_row > LAST_LINE as f32,
+            "the last line starts below the last full row: {last_row}"
+        );
+
+        assert_eq!(
+            line_at_visible_viewport_row(
+                buffer_start_line,
+                scroll,
+                CELL_HEIGHT,
+                LAST_LINE as f32,
+                LAST_LINE,
+            ),
+            LAST_LINE - 1,
+            "the integer row limit of the old code selects the line above"
+        );
+        assert_eq!(
+            line_at_visible_viewport_row(
+                buffer_start_line,
+                scroll,
+                CELL_HEIGHT,
+                last_row + 0.3,
+                LAST_LINE,
+            ),
+            LAST_LINE,
+            "rows below the last line stay on the last line"
+        );
+        assert_eq!(
+            line_at_visible_viewport_row(
+                buffer_start_line,
+                scroll,
+                CELL_HEIGHT,
+                last_row,
+                LAST_LINE,
+            ),
+            LAST_LINE,
+            "the last line starts on its own row"
+        );
+        assert_eq!(
+            line_at_visible_viewport_row(
+                buffer_start_line,
+                scroll,
+                CELL_HEIGHT,
+                last_row - 0.01,
+                LAST_LINE,
+            ),
+            LAST_LINE - 1,
+            "the line above is still selected above the last line"
+        );
+    }
+
+    #[test]
+    fn visible_hit_test_reaches_the_last_line_without_a_partial_line_offset() {
+        const CELL_HEIGHT: f32 = 20.0;
+        const LAST_LINE: i32 = 23;
+
+        let scroll = Scroll {
+            line: 16,
+            vertical: 0.0,
+            horizontal: 0.0,
+        };
+        let buffer_start_line = -16;
+
+        let last_row = row_of_viewport_line(buffer_start_line, scroll, CELL_HEIGHT, LAST_LINE);
+        assert_eq!(last_row, LAST_LINE as f32);
+
+        assert_eq!(
+            line_at_visible_viewport_row(
+                buffer_start_line,
+                scroll,
+                CELL_HEIGHT,
+                last_row + 0.3,
+                LAST_LINE,
+            ),
+            LAST_LINE,
+            "rows below the last line stay on the last line"
         );
     }
 

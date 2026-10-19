@@ -2015,8 +2015,9 @@ fn update_buffer_drag(
 
     let size = terminal.size();
     let buffer_height = buffer_size.1.unwrap_or(size.height as f32);
-    let max_row_index = (size.screen_lines().saturating_sub(1)) as f32;
     let max_col_index = (size.columns().saturating_sub(1)) as f32;
+    let (top_line, bottom_line) = terminal.visible_line_range();
+    let max_row_index = terminal.viewport_row_of_line(bottom_line).max(0.0);
     let (scroll_delta, adjusted_row, new_remainder, new_direction, new_overshoot) =
         edge_scroll_adjustment(
             y,
@@ -2037,13 +2038,11 @@ fn update_buffer_drag(
         terminal.scroll(TerminalScroll::Delta(scroll_delta));
     }
     let location = if y < 0.0 {
-        let line = -(terminal.display_offset() as i32);
-        TermPoint::new(TermLine(line), TermColumn(col as usize))
+        TermPoint::new(TermLine(top_line), TermColumn(col as usize))
     } else if y > buffer_height {
-        let line = size.screen_lines() as i32 - 1 - terminal.display_offset() as i32;
-        TermPoint::new(TermLine(line), TermColumn(col as usize))
+        TermPoint::new(TermLine(bottom_line), TermColumn(col as usize))
     } else {
-        let line = terminal.viewport_row_to_line(row);
+        let line = terminal.viewport_row_to_visible_line(row);
         TermPoint::new(TermLine(line), TermColumn(col as usize))
     };
     let side = if col.fract() < 0.5 {
@@ -2359,6 +2358,29 @@ mod tests {
         );
         assert_eq!(delta, 0);
         assert!((remainder - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn edge_scroll_bottom_clamps_to_the_partial_last_row() {
+        const BUFFER_HEIGHT: f32 = 480.0;
+        const LAST_ROW: f32 = 23.2;
+
+        let (delta, row, remainder, direction, overshoot) = edge_scroll_adjustment(
+            23.5 * CELL_HEIGHT,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            LAST_ROW,
+            0.0,
+            EdgeScrollDirection::None,
+            0.0,
+            0.0,
+        );
+
+        assert_eq!(delta, 0);
+        assert!((row - LAST_ROW).abs() < f32::EPSILON);
+        assert_eq!(remainder, 0.0);
+        assert_eq!(direction, EdgeScrollDirection::None);
+        assert_eq!(overshoot, 0.0);
     }
 
     #[test]
