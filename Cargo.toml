@@ -92,11 +92,6 @@ strip = false
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
 # iced_futures = { path = "../libcosmic/iced/futures" }
 # iced_winit = { path = "../libcosmic/iced/winit" }
-# libcosmic = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# cosmic-config = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# cosmic-theme = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# iced_futures = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
-# iced_winit = { git = "https://github.com/pop-os/libcosmic//", branch = "theme-v2" }
 
 # [patch.'https://github.com/hahnavi/alacritty']
 # alacritty_terminal = { path = "../alacritty/alacritty_terminal" }

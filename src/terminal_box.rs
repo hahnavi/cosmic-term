@@ -51,9 +51,10 @@ use crate::{
     terminal::{Metadata, builtin_glyph_rects},
 };
 
-const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(100);
+const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(15);
+const AUTOSCROLL_EDGE_BAND: f32 = 5.0;
 
-/// Drives repeated drag updates while the pointer is outside the widget.
+/// Drives repeated drag updates while the pointer is held in an edge band.
 struct DragAutoscroll {
     active: bool,
     pointer: Option<Point>,
@@ -94,16 +95,19 @@ impl DragAutoscroll {
         self.active
     }
 
-    /// Returns the stored pointer when the next tick is due.
-    fn next_due(&mut self) -> Option<(Point, f32)> {
-        if self.active && self.last_tick.elapsed() >= self.interval {
-            let elapsed = self.last_tick.elapsed();
-            self.last_tick = Instant::now();
-            let ticks = (elapsed.as_secs_f32() / self.interval.as_secs_f32()).max(1.0);
-            self.pointer.map(|pointer| (pointer, ticks))
-        } else {
-            None
+    /// Returns the stored pointer and the elapsed time as a multiple of
+    /// [`AUTOSCROLL_INTERVAL`] since the previous poll.
+    fn tick(&mut self) -> Option<(Point, f32)> {
+        if !self.active {
+            return None;
         }
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_tick)
+            .min(self.interval * 4);
+        self.last_tick = now;
+        self.pointer
+            .map(|pointer| (pointer, elapsed.as_secs_f32() / self.interval.as_secs_f32()))
     }
 }
 
@@ -983,7 +987,7 @@ where
                     if is_mouse_mode && state.dragging.is_none() {
                         state.autoscroll.stop();
                     } else {
-                        if let Some((pointer, multiplier)) = state.autoscroll.next_due()
+                        if let Some((pointer, elapsed)) = state.autoscroll.tick()
                             && update_buffer_drag(
                                 state,
                                 &mut terminal,
@@ -991,7 +995,7 @@ where
                                 pointer,
                                 layout.bounds(),
                                 self.padding,
-                                multiplier,
+                                elapsed,
                             )
                         {
                             shell.capture_event();
@@ -1614,7 +1618,12 @@ where
                         }
 
                         if matches!(state.dragging, Some(Dragging::Buffer { .. })) {
-                            if cursor_position.position_in(bounds).is_some() {
+                            let buffer_height = buffer_size
+                                .1
+                                .unwrap_or_else(|| terminal.size().height as f32);
+                            let direction =
+                                autoscroll_direction(p_global, bounds, self.padding, buffer_height);
+                            if direction == EdgeScrollDirection::None {
                                 state.autoscroll.stop();
                             } else {
                                 if state.autoscroll.is_active() {
@@ -1917,6 +1926,7 @@ fn edge_scroll_adjustment(
     buffer_height: f32,
     cell_height: f32,
     max_row_index: f32,
+    edge_band: f32,
     scroll_remainder: f32,
     last_direction: EdgeScrollDirection,
     last_overshoot: f32,
@@ -1926,57 +1936,48 @@ fn edge_scroll_adjustment(
         return (0, 0.0, 0.0, EdgeScrollDirection::None, 0.0);
     }
 
+    let band = edge_band.max(0.0).min(buffer_height * 0.5);
+    let top_edge = band;
+    let bottom_edge = buffer_height - band;
+
     let mut row = y / cell_height;
     let mut delta = 0;
     let mut remainder = scroll_remainder;
     let mut direction = EdgeScrollDirection::None;
     let mut overshoot = 0.0;
 
-    if y < 0.0 {
+    if y < top_edge {
         direction = EdgeScrollDirection::Top;
-        overshoot = (-y) / cell_height;
+        overshoot = (top_edge - y) / cell_height;
+        row = 0.0;
+    } else if y > bottom_edge {
+        direction = EdgeScrollDirection::Bottom;
+        overshoot = (y - bottom_edge) / cell_height;
+        row = max_row_index;
+    }
+
+    if direction != EdgeScrollDirection::None {
         let previous_overshoot = if last_direction == direction {
             last_overshoot
         } else {
             0.0
         };
         let overshoot_delta = overshoot - previous_overshoot;
-        let forced = if forced_increment > 0.0 {
-            forced_increment * overshoot.max(1.0)
-        } else {
-            0.0
-        };
-        if overshoot_delta > 0.0 || forced > 0.0 {
-            remainder = remainder.max(0.0) + overshoot_delta.max(0.0) + forced;
-        } else {
+        if overshoot_delta > 0.0 {
+            remainder = remainder.max(0.0) + overshoot_delta;
+        } else if overshoot_delta < 0.0 {
             remainder = remainder.max(0.0).min(overshoot.fract());
         }
-        delta = remainder.trunc() as i32;
-        remainder -= delta as f32;
-        row = 0.0;
-    } else if y > buffer_height {
-        direction = EdgeScrollDirection::Bottom;
-        overshoot = (y - buffer_height) / cell_height;
-        let previous_overshoot = if last_direction == direction {
-            last_overshoot
-        } else {
-            0.0
-        };
-        let overshoot_delta = overshoot - previous_overshoot;
-        let forced = if forced_increment > 0.0 {
-            forced_increment * overshoot.max(1.0)
-        } else {
-            0.0
-        };
-        if overshoot_delta > 0.0 || forced > 0.0 {
-            remainder = remainder.max(0.0) + overshoot_delta.max(0.0) + forced;
-        } else {
-            remainder = remainder.max(0.0).min(overshoot.fract());
+        if forced_increment > 0.0 {
+            remainder += forced_increment * (1.0 + overshoot);
         }
         let lines = remainder.trunc() as i32;
-        delta = -lines;
+        delta = if direction == EdgeScrollDirection::Bottom {
+            -lines
+        } else {
+            lines
+        };
         remainder -= lines as f32;
-        row = max_row_index;
     } else {
         remainder = 0.0;
     }
@@ -1984,6 +1985,23 @@ fn edge_scroll_adjustment(
     row = row.clamp(0.0, max_row_index);
 
     (delta, row, remainder, direction, overshoot)
+}
+
+fn autoscroll_direction(
+    pointer: Point,
+    bounds: Rectangle<f32>,
+    padding: Padding,
+    buffer_height: f32,
+) -> EdgeScrollDirection {
+    let y = (pointer.y - bounds.y) - padding.top;
+    let band = AUTOSCROLL_EDGE_BAND.max(0.0).min(buffer_height * 0.5);
+    if y < band {
+        EdgeScrollDirection::Top
+    } else if y > buffer_height - band {
+        EdgeScrollDirection::Bottom
+    } else {
+        EdgeScrollDirection::None
+    }
 }
 
 fn update_buffer_drag(
@@ -2024,6 +2042,7 @@ fn update_buffer_drag(
             buffer_height,
             size.cell_height,
             max_row_index,
+            AUTOSCROLL_EDGE_BAND,
             *edge_scroll_remainder,
             *last_edge_direction,
             *last_edge_overshoot,
@@ -2034,16 +2053,27 @@ fn update_buffer_drag(
     *last_edge_overshoot = new_overshoot;
     let col = (x / size.cell_width).clamp(0.0, max_col_index);
     let row = adjusted_row.clamp(0.0, max_row_index);
-    if scroll_delta != 0 {
+    let scrolled = if scroll_delta != 0 {
+        let before = terminal.display_offset();
         terminal.scroll(TerminalScroll::Delta(scroll_delta));
-    }
-    let location = if y < 0.0 {
-        TermPoint::new(TermLine(top_line), TermColumn(col as usize))
-    } else if y > buffer_height {
-        TermPoint::new(TermLine(bottom_line), TermColumn(col as usize))
+        terminal.display_offset() != before
     } else {
-        let line = terminal.viewport_row_to_visible_line(row);
-        TermPoint::new(TermLine(line), TermColumn(col as usize))
+        false
+    };
+    let (top_line, bottom_line) = if scrolled {
+        terminal.visible_line_range()
+    } else {
+        (top_line, bottom_line)
+    };
+    let location = match new_direction {
+        EdgeScrollDirection::Top => TermPoint::new(TermLine(top_line), TermColumn(col as usize)),
+        EdgeScrollDirection::Bottom => {
+            TermPoint::new(TermLine(bottom_line), TermColumn(col as usize))
+        }
+        EdgeScrollDirection::None => {
+            let line = terminal.viewport_row_to_visible_line(row);
+            TermPoint::new(TermLine(line), TermColumn(col as usize))
+        }
     };
     let side = if col.fract() < 0.5 {
         TermSide::Left
@@ -2056,9 +2086,15 @@ fn update_buffer_drag(
             selection.update(location, side);
         }
     }
+    let changed = scrolled || location != *last_point || side != *last_side;
     *last_point = location;
     *last_side = side;
-    terminal.needs_update = true;
+    if changed {
+        terminal.needs_update = true;
+    }
+    if scrolled {
+        sync_smooth_scroll(state, terminal);
+    }
 
     true
 }
@@ -2185,7 +2221,11 @@ fn csi_modify_other_keys(code: u8, modifiers: u8) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EdgeScrollDirection, csi_modify_other_keys, csi_u, edge_scroll_adjustment};
+    use super::{
+        AUTOSCROLL_EDGE_BAND, EdgeScrollDirection, autoscroll_direction, csi_modify_other_keys,
+        csi_u, edge_scroll_adjustment,
+    };
+    use cosmic::iced::{Padding, Point, Rectangle, Size};
 
     #[test]
     fn csi_u_encodes_kitty_control_codes() {
@@ -2220,6 +2260,7 @@ mod tests {
             CELL_HEIGHT,
             MAX_ROW,
             0.0,
+            0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
@@ -2233,6 +2274,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2251,6 +2293,7 @@ mod tests {
             CELL_HEIGHT,
             MAX_ROW,
             0.0,
+            0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
@@ -2260,6 +2303,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2278,6 +2322,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2295,6 +2340,7 @@ mod tests {
             CELL_HEIGHT,
             MAX_ROW,
             0.0,
+            0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
@@ -2304,6 +2350,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2324,6 +2371,7 @@ mod tests {
             CELL_HEIGHT,
             MAX_ROW,
             0.0,
+            0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
@@ -2337,6 +2385,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2351,6 +2400,7 @@ mod tests {
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
@@ -2371,6 +2421,7 @@ mod tests {
             CELL_HEIGHT,
             LAST_ROW,
             0.0,
+            0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
@@ -2384,43 +2435,189 @@ mod tests {
     }
 
     #[test]
-    fn edge_scroll_forced_increment_continues_scrolling() {
+    fn edge_scroll_forced_increment_scales_with_distance() {
         let (delta, _, remainder, direction, overshoot) = edge_scroll_adjustment(
             -5.0,
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             0.0,
             EdgeScrollDirection::None,
             0.0,
             0.0,
         );
         assert_eq!(delta, 0);
+        assert!((remainder - 0.25).abs() < f32::EPSILON);
 
         let (delta, _, remainder, direction, overshoot) = edge_scroll_adjustment(
             -5.0,
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
             1.0,
         );
         assert_eq!(delta, 1);
-        assert!((remainder - 0.25).abs() < f32::EPSILON);
+        assert!((remainder - 0.5).abs() < f32::EPSILON);
 
         let (delta, _, remainder, _, _) = edge_scroll_adjustment(
             -5.0,
             BUFFER_HEIGHT,
             CELL_HEIGHT,
             MAX_ROW,
+            0.0,
             remainder,
             direction,
             overshoot,
             1.0,
         );
         assert_eq!(delta, 1);
-        assert!((remainder - 0.25).abs() < f32::EPSILON);
+        assert!((remainder - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn edge_band_starts_autoscroll_inside_the_viewport() {
+        let (delta, row, _, direction, overshoot) = edge_scroll_adjustment(
+            BUFFER_HEIGHT - 2.0,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            0.0,
+            EdgeScrollDirection::None,
+            0.0,
+            0.0,
+        );
+        assert_eq!(delta, 0);
+        assert!((row - MAX_ROW).abs() < f32::EPSILON);
+        assert_eq!(direction, EdgeScrollDirection::Bottom);
+        assert!((overshoot - 0.15).abs() < f32::EPSILON);
+
+        let (delta, ..) = edge_scroll_adjustment(
+            BUFFER_HEIGHT - 2.0,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            0.0,
+            EdgeScrollDirection::None,
+            0.0,
+            1.0,
+        );
+        assert_eq!(delta, -1);
+    }
+
+    #[test]
+    fn edge_band_accelerates_scroll_rate_with_distance() {
+        let bottom_edge = BUFFER_HEIGHT - AUTOSCROLL_EDGE_BAND;
+
+        let (_, _, remainder, direction, overshoot) = edge_scroll_adjustment(
+            bottom_edge + 0.01,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            0.0,
+            EdgeScrollDirection::None,
+            0.0,
+            0.0,
+        );
+        let (delta, ..) = edge_scroll_adjustment(
+            bottom_edge + 0.01,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            remainder,
+            direction,
+            overshoot,
+            1.0,
+        );
+        assert_eq!(delta, -1);
+
+        let (_, _, remainder, direction, overshoot) = edge_scroll_adjustment(
+            bottom_edge + 3.0 * CELL_HEIGHT,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            0.0,
+            direction,
+            overshoot,
+            0.0,
+        );
+        let (delta, ..) = edge_scroll_adjustment(
+            bottom_edge + 3.0 * CELL_HEIGHT,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            remainder,
+            direction,
+            overshoot,
+            1.0,
+        );
+        assert_eq!(delta, -4);
+    }
+
+    #[test]
+    fn edge_band_partial_ticks_accumulate() {
+        let y = BUFFER_HEIGHT - 2.0;
+
+        let (_, _, remainder, direction, overshoot) = edge_scroll_adjustment(
+            y,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            0.0,
+            EdgeScrollDirection::None,
+            0.0,
+            0.0,
+        );
+
+        let (delta, _, remainder, _, _) = edge_scroll_adjustment(
+            y,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            remainder,
+            direction,
+            overshoot,
+            0.5,
+        );
+        assert_eq!(delta, 0);
+        assert!((remainder - 0.725).abs() < f32::EPSILON);
+
+        let (delta, _, _, _, _) = edge_scroll_adjustment(
+            y,
+            BUFFER_HEIGHT,
+            CELL_HEIGHT,
+            MAX_ROW,
+            AUTOSCROLL_EDGE_BAND,
+            remainder,
+            direction,
+            overshoot,
+            0.5,
+        );
+        assert_eq!(delta, -1);
+    }
+
+    #[test]
+    fn autoscroll_direction_uses_the_inside_bands() {
+        let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(500.0, 200.0));
+        let padding = Padding::new(0.0);
+        let at = |y: f32| autoscroll_direction(Point::new(100.0, y), bounds, padding, 200.0);
+
+        assert_eq!(at(20.0), EdgeScrollDirection::Top);
+        assert_eq!(at(25.0), EdgeScrollDirection::None);
+        assert_eq!(at(100.0), EdgeScrollDirection::None);
+        assert_eq!(at(217.0), EdgeScrollDirection::Bottom);
+        assert_eq!(at(300.0), EdgeScrollDirection::Bottom);
     }
 }
